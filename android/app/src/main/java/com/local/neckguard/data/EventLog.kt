@@ -59,7 +59,7 @@ class EventLog(context: Context) {
     private val file = File(context.filesDir, "events.jsonl")
     private val lock = Any()
 
-    suspend fun append(event: PostureEvent) = withContext(Dispatchers.IO) {
+    suspend fun append(event: PostureEvent): Unit = withContext(Dispatchers.IO) {
         try {
             synchronized(lock) {
                 file.appendText(event.toJson().toString() + "\n")

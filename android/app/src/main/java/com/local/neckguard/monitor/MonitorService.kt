@@ -106,9 +106,9 @@ class MonitorService : LifecycleService() {
         } catch (e: Exception) {
             // Android 14+ 在后台启动 camera 类型前台服务会抛 ForegroundServiceStartNotAllowedException
             Log.e(TAG, "startForeground failed", e)
-            MonitorBus.update {
-                it.copy(running = false, phase = MonitorPhase.ERROR, lastError = "无法启动前台服务: ${e.message}")
-            }
+            val message = "无法启动前台服务，请重新打开应用并点击开始监测: ${e.message}"
+            MonitorBus.update { it.copy(running = false, phase = MonitorPhase.ERROR, lastError = message) }
+            notifier.postError(message)
             stopSelf()
             return
         }
