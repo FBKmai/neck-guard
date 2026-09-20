@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">颈椎卫士</string>
+    <string name="channel_alert_name">前倾提醒</string>
+    <string name="channel_alert_desc">检测到头部明显前倾时的提醒</string>
+    <string name="channel_status_name">监测状态</string>
+    <string name="channel_status_desc">后台监测运行状态（常驻通知）</string>
+    <string name="notif_alert_title">检测到头部前倾</string>
+    <string name="notif_status_title">颈椎卫士正在监测</string>
+</resources>

@@ -1,0 +1,24 @@
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/*.iml
+android/app/*.iml
+android/.kotlin/
+android/app/src/main/assets/pose_landmarker_lite.task
+
+# Python
+tools/.venv/
+tools/models/
+tools/__pycache__/
+tools/output/
+tools/output_test/
+*.pyc
+
+# 用户提供的照片与本地输出
+samples/
+*.log
+.DS_Store
+Thumbs.db
