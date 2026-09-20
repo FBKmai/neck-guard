@@ -83,8 +83,13 @@ class PoseLandmarkerEngine(
             if (lm == null || closed.get()) return
             val now = SystemClock.uptimeMillis()
             if (now - lastSubmitAt.get() < minIntervalMillis) return
-            // 有一帧在推理时不再堆积，KEEP_ONLY_LATEST 会丢弃中间帧
-            if (inFlight.get() > 0) return
+            // 有一帧在推理时不再堆积，KEEP_ONLY_LATEST 会丢弃中间帧；
+            // 若 MediaPipe 内部丢帧导致回调缺失，超过 STALL_MILLIS 后强制复位，避免永久卡死
+            if (inFlight.get() > 0) {
+                if (now - lastSubmitAt.get() < STALL_MILLIS) return
+                Log.w(TAG, "inference stalled, resetting in-flight counter")
+                inFlight.set(0L)
+            }
             lastSubmitAt.set(now)
 
             val bitmap = toUprightBitmap(imageProxy)
@@ -151,6 +156,7 @@ class PoseLandmarkerEngine(
     companion object {
         private const val TAG = "PoseEngine"
         const val MODEL_ASSET = "pose_landmarker_lite.task"
+        private const val STALL_MILLIS = 1_500L
 
         /** 把分析帧按 rotationDegrees 旋转到正向（与 targetRotation 对齐）。 */
         fun toUprightBitmap(imageProxy: ImageProxy): Bitmap {
