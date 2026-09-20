@@ -37,11 +37,13 @@ class SnapshotStore(context: Context) {
         neckDeg: Float?,
         thresholdDeg: Float?,
         timestampMillis: Long,
+        tag: String = "snap",
+        sequence: Int = 0,
     ): File? = withContext(Dispatchers.IO) {
         try {
             val base = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return@withContext null
             val annotated = drawOverlay(base, measurement, neckDeg, thresholdDeg)
-            val name = "snap_" + FILE_TS.format(Date(timestampMillis)) + ".jpg"
+            val name = tag + "_" + FILE_TS.format(Date(timestampMillis)) + "_" + sequence + ".jpg"
             val file = File(dir, name)
             file.outputStream().use { annotated.compress(Bitmap.CompressFormat.JPEG, 85, it) }
             if (annotated !== base) annotated.recycle()
@@ -105,7 +107,7 @@ class SnapshotStore(context: Context) {
 
     companion object {
         private const val TAG = "SnapshotStore"
-        private const val MAX_FILES = 50
+        private const val MAX_FILES = 300
         private val FILE_TS = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US)
         private val DISPLAY_TS = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
     }

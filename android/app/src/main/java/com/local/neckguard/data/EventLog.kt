@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
@@ -25,8 +26,14 @@ data class PostureEvent(
     val torsoDeg: Float? = null,
     val thresholdDeg: Float? = null,
     val message: String? = null,
-    val snapshotPath: String? = null,
+    /** 该事件关联的截图，ALERT/CONFIRMED 可能有多张（前倾过程中的多帧），WINDOW 最多一张。 */
+    val snapshotPaths: List<String> = emptyList(),
+    /** WINDOW 事件的判定：GOOD / BAD / INVALID。 */
+    val verdict: String? = null,
 ) {
+    val snapshotPath: String?
+        get() = snapshotPaths.firstOrNull()
+
     fun toJson(): JSONObject = JSONObject().apply {
         put("ts", timestampMillis)
         put("type", type.name)
@@ -34,19 +41,29 @@ data class PostureEvent(
         torsoDeg?.let { put("torso", it.toDouble()) }
         thresholdDeg?.let { put("threshold", it.toDouble()) }
         message?.let { put("message", it) }
-        snapshotPath?.let { put("snapshot", it) }
+        verdict?.let { put("verdict", it) }
+        if (snapshotPaths.isNotEmpty()) put("snapshots", JSONArray(snapshotPaths))
     }
 
     companion object {
-        fun fromJson(json: JSONObject): PostureEvent = PostureEvent(
-            timestampMillis = json.getLong("ts"),
-            type = runCatching { EventType.valueOf(json.getString("type")) }.getOrDefault(EventType.INFO),
-            neckDeg = if (json.has("neck")) json.getDouble("neck").toFloat() else null,
-            torsoDeg = if (json.has("torso")) json.getDouble("torso").toFloat() else null,
-            thresholdDeg = if (json.has("threshold")) json.getDouble("threshold").toFloat() else null,
-            message = if (json.has("message")) json.getString("message") else null,
-            snapshotPath = if (json.has("snapshot")) json.getString("snapshot") else null,
-        )
+        fun fromJson(json: JSONObject): PostureEvent {
+            val paths = ArrayList<String>()
+            json.optJSONArray("snapshots")?.let { arr ->
+                for (i in 0 until arr.length()) arr.optString(i).takeIf { it.isNotBlank() }?.let(paths::add)
+            }
+            // 兼容旧格式的单张 snapshot 字段
+            if (paths.isEmpty() && json.has("snapshot")) paths.add(json.getString("snapshot"))
+            return PostureEvent(
+                timestampMillis = json.getLong("ts"),
+                type = runCatching { EventType.valueOf(json.getString("type")) }.getOrDefault(EventType.INFO),
+                neckDeg = if (json.has("neck")) json.getDouble("neck").toFloat() else null,
+                torsoDeg = if (json.has("torso")) json.getDouble("torso").toFloat() else null,
+                thresholdDeg = if (json.has("threshold")) json.getDouble("threshold").toFloat() else null,
+                message = if (json.has("message")) json.getString("message") else null,
+                snapshotPaths = paths,
+                verdict = if (json.has("verdict")) json.getString("verdict") else null,
+            )
+        }
     }
 }
 

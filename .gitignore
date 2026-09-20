@@ -22,3 +22,5 @@ samples/
 *.log
 .DS_Store
 Thumbs.db
+pc/snapshots/
+pc/__pycache__/

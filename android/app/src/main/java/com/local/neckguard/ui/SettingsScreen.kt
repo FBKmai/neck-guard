@@ -31,7 +31,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.platform.LocalContext
 import com.local.neckguard.data.EventLog
+import com.local.neckguard.data.EventType
+import com.local.neckguard.data.PostureEvent
+import com.local.neckguard.monitor.SnapshotStore
+import com.local.neckguard.report.PcSink
 import com.local.neckguard.data.Settings
 import com.local.neckguard.data.SettingsRepository
 import kotlinx.coroutines.launch
@@ -43,6 +48,7 @@ fun SettingsScreen(
     eventLog: EventLog,
     modifier: Modifier = Modifier,
 ) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val settings by settingsRepo.settings.collectAsState(initial = Settings())
     var message by remember { mutableStateOf<String?>(null) }
@@ -165,6 +171,79 @@ fun SettingsScreen(
         )
 
         HorizontalDivider()
+        Text("电脑接收端（局域网）", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "在电脑上运行 pc/neck_receiver.py，手机检测到前倾后把事件和截图发到电脑，电脑弹通知并响铃。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        SwitchRow(
+            label = "上报到电脑",
+            hint = "开启后每次提醒都会同步发送到下面的地址",
+            checked = settings.pcEnabled,
+            onChange = { v -> save { it.copy(pcEnabled = v) } },
+        )
+        TextField(
+            label = "电脑地址",
+            hint = "接收脚本启动时打印的地址，例如 http://192.168.1.23:8765",
+            stored = settings.pcEndpoint,
+            keyboardType = KeyboardType.Uri,
+            onSave = { v -> save { it.copy(pcEndpoint = v.trim()) } },
+        )
+        TextField(
+            label = "共享密钥",
+            hint = "与接收脚本 --token 参数一致；两边都留空则不校验",
+            stored = settings.pcToken,
+            keyboardType = KeyboardType.Password,
+            onSave = { v -> save { it.copy(pcToken = v.trim()) } },
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                onClick = {
+                    val base = settings.pcBaseUrl
+                    if (base == null) {
+                        message = "请先填写电脑地址"
+                    } else {
+                        message = "正在连接 $base"
+                        scope.launch {
+                            message = when (val r = PcSink(base, settings.pcToken, "settings-test").ping()) {
+                                is PcSink.Result.Ok -> "连接成功: ${r.body.take(80)}"
+                                is PcSink.Result.Failed -> "连接失败: ${r.message}"
+                            }
+                        }
+                    }
+                },
+                modifier = Modifier.weight(1f),
+            ) { Text("测试连接") }
+            OutlinedButton(
+                onClick = {
+                    val base = settings.pcBaseUrl
+                    if (base == null) {
+                        message = "请先填写电脑地址"
+                    } else {
+                        message = "正在发送测试事件"
+                        scope.launch {
+                            val event = PostureEvent(
+                                timestampMillis = System.currentTimeMillis(),
+                                type = EventType.INFO,
+                                neckDeg = 47.3f,
+                                torsoDeg = 6.1f,
+                                thresholdDeg = 40f,
+                                message = "手机端测试事件",
+                            )
+                            val snapshot = SnapshotStore(context).listFiles().firstOrNull()
+                            message = when (val r = PcSink(base, settings.pcToken, "settings-test").sendTest(event, snapshot)) {
+                                is PcSink.Result.Ok -> "发送成功，电脑应已弹出通知"
+                                is PcSink.Result.Failed -> "发送失败: ${r.message}"
+                            }
+                        }
+                    }
+                },
+                modifier = Modifier.weight(1f),
+            ) { Text("发送测试事件") }
+        }
+
+        HorizontalDivider()
         Text("相机与调试", style = MaterialTheme.typography.titleMedium)
         SwitchRow(
             label = "使用前置摄像头",
@@ -275,6 +354,50 @@ private fun <T : Any> NumberField(
                 label = { Text(label) },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier
+                    .weight(1f)
+                    .onFocusChanged { state ->
+                        val wasFocused = focused
+                        focused = state.isFocused
+                        if (wasFocused && !state.isFocused) commit()
+                    },
+            )
+            TextButton(onClick = { commit() }, enabled = text != stored) { Text("保存") }
+        }
+        Text(
+            hint,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 4.dp, top = 2.dp),
+        )
+    }
+}
+
+/** 通用文本输入：失焦或点「保存」时提交，stored 变化时同步刷新。 */
+@Composable
+private fun TextField(
+    label: String,
+    hint: String,
+    stored: String,
+    keyboardType: KeyboardType,
+    onSave: (String) -> Unit,
+) {
+    var text by rememberSaveable(stored) { mutableStateOf(stored) }
+    var focused by remember { mutableStateOf(false) }
+    LaunchedEffect(stored) { if (!focused) text = stored }
+
+    fun commit() {
+        if (text != stored) onSave(text)
+    }
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                label = { Text(label) },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
                 modifier = Modifier
                     .weight(1f)
                     .onFocusChanged { state ->

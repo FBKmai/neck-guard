@@ -1,0 +1,2 @@
+# 可选：Windows 原生 toast 通知（带截图、可点击）。未安装时自动回退到 PowerShell toast。
+winotify>=1.1.0

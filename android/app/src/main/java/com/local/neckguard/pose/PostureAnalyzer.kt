@@ -33,6 +33,11 @@ data class WindowSummary(
     /** 角度最接近中位数的有效帧序号（addFrame 返回的序号），用于选快照。 */
     val representativeFrameIndex: Int?,
     val representative: PostureMeasurement?,
+    /**
+     * 本窗内角度超过阈值的有效帧（序号 -> 角度），按时间顺序，最多 MAX_BAD_FRAMES 个，
+     * 用于在前倾事件里展示多帧截图。
+     */
+    val badFrames: List<Pair<Int, Float>> = emptyList(),
 )
 
 data class WindowOutcome(
@@ -123,6 +128,7 @@ class PostureAnalyzer(config: AnalyzerConfig = AnalyzerConfig()) {
         val medianTorso = if (torsoValues.isEmpty()) null else median(torsoValues)
 
         val representative = validFrames.minByOrNull { abs(it.second.neckInclinationDeg - medianNeck) }
+        val badFrames = pickBadFrames(validFrames, threshold)
 
         // 迟滞判定
         inForwardHead = if (inForwardHead) {
@@ -149,6 +155,7 @@ class PostureAnalyzer(config: AnalyzerConfig = AnalyzerConfig()) {
             misalignedFrames = misalignedFrames,
             representativeFrameIndex = representative?.first,
             representative = representative?.second,
+            badFrames = badFrames,
         )
         return WindowOutcome(summary, badStreak, confirmed, shouldNotify, shouldRecord)
     }
@@ -178,6 +185,19 @@ class PostureAnalyzer(config: AnalyzerConfig = AnalyzerConfig()) {
     }
 
     companion object {
+        const val MAX_BAD_FRAMES = 6
+
+        /**
+         * 从有效帧里挑出超过阈值的帧，超过 MAX_BAD_FRAMES 时按时间均匀抽样，保证覆盖整个窗。
+         */
+        fun pickBadFrames(frames: List<Pair<Int, PostureMeasurement>>, thresholdDeg: Float): List<Pair<Int, Float>> {
+            val bad = frames.filter { it.second.neckInclinationDeg > thresholdDeg }
+                .map { it.first to it.second.neckInclinationDeg }
+            if (bad.size <= MAX_BAD_FRAMES) return bad
+            val step = bad.size.toFloat() / MAX_BAD_FRAMES
+            return (0 until MAX_BAD_FRAMES).map { bad[(it * step).toInt().coerceIn(0, bad.size - 1)] }
+        }
+
         fun thresholdFor(baselineDeg: Float?, config: AnalyzerConfig): Float =
             if (baselineDeg == null) {
                 config.absoluteThresholdDeg

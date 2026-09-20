@@ -3,17 +3,24 @@ package com.local.neckguard.ui
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.HorizontalDivider
@@ -31,10 +38,13 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.local.neckguard.data.EventLog
 import com.local.neckguard.data.EventType
@@ -50,6 +60,9 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+
+/** 打开全屏预览的请求：哪条事件、从第几张开始。 */
+private data class PreviewRequest(val event: PostureEvent, val startIndex: Int)
 
 @Composable
 fun MonitorScreen(eventLog: EventLog, modifier: Modifier = Modifier) {
@@ -68,8 +81,20 @@ fun MonitorScreen(eventLog: EventLog, modifier: Modifier = Modifier) {
 
     var events by remember { mutableStateOf<List<PostureEvent>>(emptyList()) }
     LaunchedEffect(monitor.windowsRun, monitor.alertsSent, monitor.lastError) {
-        events = eventLog.readLatest(50)
+        events = eventLog.readLatest(200)
     }
+
+    var preview by remember { mutableStateOf<PreviewRequest?>(null) }
+    var showAllOthers by remember { mutableStateOf(false) }
+
+    val windowEvents = remember(events) { events.filter { it.type == EventType.WINDOW }.take(RECENT_WINDOW_COUNT) }
+    val alertEvents = remember(events) {
+        events.filter { it.type == EventType.ALERT || it.type == EventType.CONFIRMED }
+    }
+    val otherEvents = remember(events) {
+        events.filter { it.type == EventType.ERROR || it.type == EventType.INFO }
+    }
+    val shownOthers = if (showAllOthers) otherEvents else otherEvents.take(OTHER_COLLAPSED_COUNT)
 
     LazyColumn(
         modifier = modifier,
@@ -91,16 +116,15 @@ fun MonitorScreen(eventLog: EventLog, modifier: Modifier = Modifier) {
                 }
             }
         }
-        monitor.lastSnapshotPath?.let { path ->
-            item { SnapshotCard(path) }
-        }
+
+        // 最近采样：横向卡片
         item {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("最近事件", style = MaterialTheme.typography.titleMedium)
+                Text("最近采样", style = MaterialTheme.typography.titleMedium)
                 TextButton(onClick = {
                     scope.launch {
                         eventLog.clear()
@@ -109,14 +133,64 @@ fun MonitorScreen(eventLog: EventLog, modifier: Modifier = Modifier) {
                 }) { Text("清空事件") }
             }
         }
-        if (events.isEmpty()) {
-            item { Text("暂无事件", style = MaterialTheme.typography.bodyMedium) }
+        item {
+            if (windowEvents.isEmpty()) {
+                Text("暂无采样记录", style = MaterialTheme.typography.bodyMedium)
+            } else {
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    itemsIndexed(
+                        windowEvents,
+                        key = { index, it -> "w_" + it.timestampMillis.toString() + "_" + index },
+                    ) { _, event ->
+                        WindowCard(event) { preview = PreviewRequest(event, 0) }
+                    }
+                }
+            }
+        }
+
+        // 前倾事件：每条带多帧缩略图
+        item { Text("前倾事件", style = MaterialTheme.typography.titleMedium) }
+        if (alertEvents.isEmpty()) {
+            item { Text("暂无前倾事件", style = MaterialTheme.typography.bodyMedium) }
         } else {
-            itemsIndexed(events, key = { index, it -> it.timestampMillis.toString() + "_" + index }) { _, event ->
-                EventRow(event)
+            itemsIndexed(
+                alertEvents,
+                key = { index, it -> "a_" + it.timestampMillis.toString() + "_" + index },
+            ) { _, event ->
+                AlertEventRow(event) { startIndex -> preview = PreviewRequest(event, startIndex) }
                 HorizontalDivider()
             }
         }
+
+        // 其他事件：错误与信息，默认折叠
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("其他事件", style = MaterialTheme.typography.titleMedium)
+                if (otherEvents.size > OTHER_COLLAPSED_COUNT) {
+                    TextButton(onClick = { showAllOthers = !showAllOthers }) {
+                        Text(if (showAllOthers) "收起" else "展开全部 (${otherEvents.size})")
+                    }
+                }
+            }
+        }
+        if (shownOthers.isEmpty()) {
+            item { Text("暂无", style = MaterialTheme.typography.bodyMedium) }
+        } else {
+            itemsIndexed(
+                shownOthers,
+                key = { index, it -> "o_" + it.timestampMillis.toString() + "_" + index },
+            ) { _, event ->
+                OtherEventRow(event)
+            }
+        }
+    }
+
+    preview?.takeIf { it.event.snapshotPaths.isNotEmpty() }?.let { req ->
+        SnapshotPreviewDialog(event = req.event, startIndex = req.startIndex, onDismiss = { preview = null })
     }
 }
 
@@ -186,64 +260,184 @@ private fun LastSampleCard(monitor: MonitorState) {
     }
 }
 
+/** 最近采样的横向卡片：缩略图 + 时间 + 角度 + 判定。 */
 @Composable
-private fun SnapshotCard(path: String) {
-    val bitmap = remember(path) { decodeFile(path, sampleSize = 2) }
-    if (bitmap == null) return
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("最近一次提醒截图", style = MaterialTheme.typography.titleSmall)
-            Image(
-                bitmap = bitmap.asImageBitmap(),
-                contentDescription = "最近一次提醒截图",
-                modifier = Modifier.fillMaxWidth(),
-                contentScale = ContentScale.FillWidth,
+private fun WindowCard(event: PostureEvent, onOpen: () -> Unit) {
+    val verdict = event.verdict ?: VERDICT_INVALID
+    val color = verdictColor(verdict)
+    val path = event.snapshotPath
+    Card(modifier = Modifier.width(132.dp)) {
+        Column {
+            Thumbnail(
+                path = path,
+                placeholder = if (verdict == VERDICT_INVALID) "无效" else "无图",
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(96.dp)
+                    .clickable(enabled = path != null, onClick = onOpen),
             )
+            Column(Modifier.padding(horizontal = 8.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(TIME_FMT.format(Date(event.timestampMillis)), style = MaterialTheme.typography.labelSmall)
+                Text(fmtDeg(event.neckDeg), style = MaterialTheme.typography.titleSmall, color = color)
+                Text(verdictLabel(verdict), style = MaterialTheme.typography.labelSmall, color = color)
+            }
+        }
+    }
+}
+
+/** 前倾事件行：文字信息 + 该事件全部截图的横向缩略图。 */
+@Composable
+private fun AlertEventRow(event: PostureEvent, onOpen: (Int) -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        val typeColor = when (event.type) {
+            EventType.ALERT -> MaterialTheme.colorScheme.error
+            EventType.CONFIRMED -> MaterialTheme.colorScheme.tertiary
+            EventType.ERROR -> MaterialTheme.colorScheme.error
+            EventType.WINDOW, EventType.INFO -> MaterialTheme.colorScheme.onSurfaceVariant
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(TIME_FMT.format(Date(event.timestampMillis)), style = MaterialTheme.typography.labelMedium)
+            Text(eventTypeText(event.type), color = typeColor, style = MaterialTheme.typography.labelLarge)
+        }
+        if (event.neckDeg != null || event.thresholdDeg != null) {
+            Text(
+                buildString {
+                    append("颈部 ").append(fmtDeg(event.neckDeg))
+                    event.torsoDeg?.let { append("  躯干 ").append(fmtDeg(it)) }
+                    event.thresholdDeg?.let { append("  阈值 ").append(fmtDeg(it)) }
+                },
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        event.message?.takeIf { it.isNotBlank() }?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall)
+        }
+        if (event.snapshotPaths.isNotEmpty()) {
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                itemsIndexed(event.snapshotPaths, key = { index, p -> p + "_" + index }) { index, p ->
+                    Thumbnail(
+                        path = p,
+                        placeholder = "无图",
+                        modifier = Modifier
+                            .size(72.dp)
+                            .clickable { onOpen(index) },
+                    )
+                }
+            }
         }
     }
 }
 
 @Composable
-private fun EventRow(event: PostureEvent) {
+private fun OtherEventRow(event: PostureEvent) {
+    val color = when (event.type) {
+        EventType.ERROR -> MaterialTheme.colorScheme.error
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 8.dp),
+            .padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        val thumb = event.snapshotPath?.let { path -> remember(path) { decodeFile(path, sampleSize = 4) } }
-        if (thumb != null) {
-            Image(
-                bitmap = thumb.asImageBitmap(),
-                contentDescription = null,
-                modifier = Modifier.size(72.dp),
-                contentScale = ContentScale.Crop,
-            )
-            Spacer(Modifier.width(12.dp))
+        Text(TIME_FMT.format(Date(event.timestampMillis)), style = MaterialTheme.typography.labelMedium)
+        Text(eventTypeText(event.type), color = color, style = MaterialTheme.typography.labelMedium)
+        Text(
+            event.message?.takeIf { it.isNotBlank() } ?: "",
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+/** 缩略图：解码失败或文件缺失时显示灰色占位。 */
+@Composable
+private fun Thumbnail(path: String?, placeholder: String, modifier: Modifier) {
+    val bitmap = remember(path) { path?.let { decodeFile(it, sampleSize = 4) } }
+    if (bitmap != null) {
+        Image(
+            bitmap = bitmap.asImageBitmap(),
+            contentDescription = null,
+            modifier = modifier,
+            contentScale = ContentScale.Crop,
+        )
+    } else {
+        Box(
+            modifier = modifier.background(Color(0xFF4A4A4A)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(placeholder, color = Color.White, style = MaterialTheme.typography.labelSmall)
         }
-        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            val typeColor = when (event.type) {
-                EventType.ALERT -> MaterialTheme.colorScheme.error
-                EventType.CONFIRMED -> MaterialTheme.colorScheme.tertiary
-                EventType.ERROR -> MaterialTheme.colorScheme.error
-                EventType.WINDOW, EventType.INFO -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+}
+
+/** 全屏预览：左右滑动同一事件的多张截图。 */
+@Composable
+private fun SnapshotPreviewDialog(event: PostureEvent, startIndex: Int, onDismiss: () -> Unit) {
+    val paths = event.snapshotPaths
+    val pagerState = rememberPagerState(
+        initialPage = startIndex.coerceIn(0, paths.lastIndex),
+        pageCount = { paths.size },
+    )
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+            ) {
+                TextButton(onClick = onDismiss) { Text("关闭", color = Color.White) }
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(TIME_FMT.format(Date(event.timestampMillis)), style = MaterialTheme.typography.labelMedium)
-                Text(eventTypeText(event.type), color = typeColor, style = MaterialTheme.typography.labelLarge)
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+            ) { page ->
+                val path = paths[page]
+                val bitmap = remember(path) { decodeFile(path, sampleSize = 1) }
+                if (bitmap != null) {
+                    Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = null,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Fit,
+                    )
+                } else {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text("图片不存在或已被清理", color = Color.White)
+                    }
+                }
             }
-            if (event.neckDeg != null || event.thresholdDeg != null) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text("第 ${pagerState.currentPage + 1} / ${paths.size} 张", color = Color.White)
                 Text(
                     buildString {
-                        append("颈部 ").append(fmtDeg(event.neckDeg))
-                        event.torsoDeg?.let { append("  躯干 ").append(fmtDeg(it)) }
-                        event.thresholdDeg?.let { append("  阈值 ").append(fmtDeg(it)) }
+                        append(TIME_FMT.format(Date(event.timestampMillis)))
+                        append("  ").append(eventTypeText(event.type))
+                        append("  颈部 ").append(fmtDeg(event.neckDeg))
+                        append("  阈值 ").append(fmtDeg(event.thresholdDeg))
                     },
+                    color = Color.White,
                     style = MaterialTheme.typography.bodySmall,
                 )
-            }
-            event.message?.takeIf { it.isNotBlank() }?.let {
-                Text(it, style = MaterialTheme.typography.bodySmall)
             }
         }
     }
@@ -274,9 +468,21 @@ private fun verdictText(v: WindowVerdict): String = when (v) {
     WindowVerdict.INVALID -> "无效"
 }
 
+private fun verdictLabel(v: String): String = when (v) {
+    VERDICT_GOOD -> "正常"
+    VERDICT_BAD -> "前倾"
+    else -> "无效"
+}
+
+private fun verdictColor(v: String): Color = when (v) {
+    VERDICT_GOOD -> Color(0xFF43A047)
+    VERDICT_BAD -> Color(0xFFE53935)
+    else -> Color(0xFF9E9E9E)
+}
+
 private fun eventTypeText(t: EventType): String = when (t) {
     EventType.ALERT -> "已提醒"
-    EventType.CONFIRMED -> "确认前倾(冷却中)"
+    EventType.CONFIRMED -> "已确认(冷却中)"
     EventType.WINDOW -> "采样"
     EventType.ERROR -> "错误"
     EventType.INFO -> "信息"
@@ -291,5 +497,11 @@ private fun durationText(millis: Long): String {
     val s = total % 60
     return if (h > 0) String.format(Locale.US, "%d时%02d分%02d秒", h, m, s) else String.format(Locale.US, "%d分%02d秒", m, s)
 }
+
+private const val RECENT_WINDOW_COUNT = 12
+private const val OTHER_COLLAPSED_COUNT = 5
+private const val VERDICT_GOOD = "GOOD"
+private const val VERDICT_BAD = "BAD"
+private const val VERDICT_INVALID = "INVALID"
 
 private val TIME_FMT = SimpleDateFormat("HH:mm:ss", Locale.US)

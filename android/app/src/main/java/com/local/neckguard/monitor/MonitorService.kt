@@ -27,11 +27,13 @@ import com.local.neckguard.pose.PoseFrame
 import com.local.neckguard.pose.PoseLandmarkerEngine
 import com.local.neckguard.pose.PostureAnalyzer
 import com.local.neckguard.pose.PostureGeometry
+import com.local.neckguard.pose.PostureMeasurement
 import com.local.neckguard.pose.WindowOutcome
 import com.local.neckguard.pose.WindowVerdict
 import com.local.neckguard.report.CompositeSink
 import com.local.neckguard.report.EventSink
 import com.local.neckguard.report.LocalNotificationSink
+import com.local.neckguard.report.PcSink
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -39,6 +41,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -73,7 +76,11 @@ class MonitorService : LifecycleService() {
     private val windowOpen = AtomicBoolean(false)
     private val lastFrameAt = AtomicLong(0L)
     private val windowJpegs = HashMap<Int, ByteArray>()
+    private val windowMeasurements = HashMap<Int, PostureMeasurement>()
     private val windowLock = Any()
+    private val deviceId: String by lazy {
+        android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID) ?: "android"
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -82,6 +89,17 @@ class MonitorService : LifecycleService() {
         snapshotStore = SnapshotStore(applicationContext)
         notifier = AlertNotifier(applicationContext)
         sink = CompositeSink(listOf(LocalNotificationSink(notifier)))
+    }
+
+    /** 按当前设置重建事件出口：本机通知固定有，电脑上报按开关。 */
+    private fun rebuildSink() {
+        val sinks = ArrayList<EventSink>()
+        sinks.add(LocalNotificationSink(notifier))
+        val base = settings.pcBaseUrl
+        if (settings.pcEnabled && base != null) {
+            sinks.add(PcSink(base, settings.pcToken, deviceId))
+        }
+        sink = CompositeSink(sinks)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -122,6 +140,7 @@ class MonitorService : LifecycleService() {
                 settings = settingsRepo.current()
                 analyzer.config = settings.toAnalyzerConfig()
                 analyzer.setBaseline(settings.baselineDeg)
+                rebuildSink()
                 MonitorBus.update { it.copy(thresholdDeg = analyzer.thresholdDeg, baselineDeg = analyzer.baselineDeg) }
 
                 val eng = PoseLandmarkerEngine(applicationContext, ::onPoseFrame, ::onEngineError)
@@ -147,6 +166,7 @@ class MonitorService : LifecycleService() {
                     settings = settingsRepo.current()
                     analyzer.config = settings.toAnalyzerConfig()
                     if (analyzer.baselineDeg != settings.baselineDeg) analyzer.setBaseline(settings.baselineDeg)
+                    rebuildSink()
 
                     runWindow()
                     waitMillis = nextInterval()
@@ -184,7 +204,10 @@ class MonitorService : LifecycleService() {
     private suspend fun runWindow() {
         val windowMillis = settings.windowSec.coerceIn(1, 15) * 1000L
         MonitorBus.update { it.copy(phase = MonitorPhase.SAMPLING) }
-        synchronized(windowLock) { windowJpegs.clear() }
+        synchronized(windowLock) {
+            windowJpegs.clear()
+            windowMeasurements.clear()
+        }
         analyzer.beginWindow()
         lastFrameAt.set(0L)
         windowOpen.set(true)
@@ -226,26 +249,49 @@ class MonitorService : LifecycleService() {
                 invalidWindows = it.invalidWindows + if (s.verdict == WindowVerdict.INVALID) 1 else 0,
             )
         }
-        val jpeg = s.representativeFrameIndex?.let { idx -> synchronized(windowLock) { windowJpegs[idx] } }
-        synchronized(windowLock) { windowJpegs.clear() }
-
-        if (settings.saveEveryWindowSnapshot && s.verdict != WindowVerdict.INVALID) {
-            val file = jpeg?.let { snapshotStore.save(it, s.representative, s.medianNeckDeg, s.thresholdDeg, now) }
-            eventLog.append(
-                PostureEvent(
-                    timestampMillis = now,
-                    type = EventType.WINDOW,
-                    neckDeg = s.medianNeckDeg,
-                    torsoDeg = s.medianTorsoDeg,
-                    thresholdDeg = s.thresholdDeg,
-                    message = "${s.verdict} 有效帧 ${s.validFrames}/${s.totalFrames}",
-                    snapshotPath = file?.absolutePath,
-                ),
-            )
+        // 取出本窗缓存的帧后立刻清空，避免占内存
+        val jpegs: Map<Int, ByteArray>
+        val measurements: Map<Int, PostureMeasurement>
+        synchronized(windowLock) {
+            jpegs = HashMap(windowJpegs)
+            measurements = HashMap(windowMeasurements)
+            windowJpegs.clear()
+            windowMeasurements.clear()
         }
+        val representativeJpeg = s.representativeFrameIndex?.let { jpegs[it] }
+
+        // 每个采样窗都记一条 WINDOW 事件，供监测页「最近采样」展示；有效窗附代表帧截图
+        val windowSnapshot = if (s.verdict != WindowVerdict.INVALID) {
+            representativeJpeg?.let { snapshotStore.save(it, s.representative, s.medianNeckDeg, s.thresholdDeg, now, "win") }
+        } else {
+            null
+        }
+        eventLog.append(
+            PostureEvent(
+                timestampMillis = now,
+                type = EventType.WINDOW,
+                neckDeg = s.medianNeckDeg,
+                torsoDeg = s.medianTorsoDeg,
+                thresholdDeg = s.thresholdDeg,
+                message = "有效帧 ${s.validFrames}/${s.totalFrames}" +
+                    if (s.misalignedFrames > 0) "，未对齐 ${s.misalignedFrames}" else "",
+                snapshotPaths = listOfNotNull(windowSnapshot?.absolutePath),
+                verdict = s.verdict.name,
+            ),
+        )
 
         if (outcome.shouldRecord) {
-            val file = jpeg?.let { snapshotStore.save(it, s.representative, s.medianNeckDeg, s.thresholdDeg, now) }
+            // 前倾事件：保存本窗内超阈值的多帧（最多 MAX_BAD_FRAMES），每帧标注各自角度
+            val badFrameFiles = ArrayList<File>()
+            for ((index, angle) in s.badFrames) {
+                val jpeg = jpegs[index] ?: continue
+                val file = snapshotStore.save(jpeg, measurements[index], angle, s.thresholdDeg, now, "bad", badFrameFiles.size)
+                if (file != null) badFrameFiles.add(file)
+            }
+            // 万一没有超阈值帧缓存，退回代表帧
+            if (badFrameFiles.isEmpty()) {
+                windowSnapshot?.let(badFrameFiles::add)
+            }
             val type = if (outcome.shouldNotify) EventType.ALERT else EventType.CONFIRMED
             val event = PostureEvent(
                 timestampMillis = now,
@@ -253,13 +299,16 @@ class MonitorService : LifecycleService() {
                 neckDeg = s.medianNeckDeg,
                 torsoDeg = s.medianTorsoDeg,
                 thresholdDeg = s.thresholdDeg,
-                message = "连续 ${outcome.badStreak} 窗前倾",
-                snapshotPath = file?.absolutePath,
+                message = "连续 ${outcome.badStreak} 窗前倾，${badFrameFiles.size} 帧截图",
+                snapshotPaths = badFrameFiles.map { it.absolutePath },
+                verdict = s.verdict.name,
             )
             eventLog.append(event)
             if (outcome.shouldNotify) {
-                sink.deliver(event, file)
-                MonitorBus.update { it.copy(alertsSent = it.alertsSent + 1, lastSnapshotPath = file?.absolutePath) }
+                // 通知与电脑上报都用中位数代表帧，多帧留在 App 内查看
+                val primary = windowSnapshot ?: badFrameFiles.firstOrNull()
+                sink.deliver(event, primary)
+                MonitorBus.update { it.copy(alertsSent = it.alertsSent + 1, lastSnapshotPath = primary?.absolutePath) }
             }
         }
         notifier.updateStatus(statusText())
@@ -277,7 +326,10 @@ class MonitorService : LifecycleService() {
             if (result is FrameResult.Valid) {
                 val jpeg = snapshotStore.encodeJpeg(frame.bitmap)
                 synchronized(windowLock) {
-                    if (windowJpegs.size < MAX_JPEGS_PER_WINDOW) windowJpegs[index] = jpeg
+                    if (windowJpegs.size < MAX_JPEGS_PER_WINDOW) {
+                        windowJpegs[index] = jpeg
+                        windowMeasurements[index] = result.measurement
+                    }
                 }
             }
         } catch (e: Throwable) {

@@ -167,6 +167,28 @@ class PostureAnalyzerTest {
     }
 
     @Test
+    fun badFrames_onlyAboveThreshold_inOrder() {
+        val analyzer = PostureAnalyzer(config)
+        analyzer.beginWindow()
+        analyzer.addFrame(FrameResult.Valid(measurement(45f)))
+        analyzer.addFrame(FrameResult.Valid(measurement(30f)))
+        analyzer.addFrame(FrameResult.LowVisibility)
+        analyzer.addFrame(FrameResult.Valid(measurement(50f)))
+        val outcome = analyzer.endWindow(0L)
+        assertEquals(listOf(0 to 45f, 3 to 50f), outcome.summary.badFrames)
+    }
+
+    @Test
+    fun pickBadFrames_samplesEvenly_whenTooMany() {
+        val frames = (0 until 30).map { it to measurement(41f + it) }
+        val picked = PostureAnalyzer.pickBadFrames(frames, 40f)
+        assertEquals(PostureAnalyzer.MAX_BAD_FRAMES, picked.size)
+        assertEquals(0, picked.first().first)
+        assertEquals(25, picked.last().first)
+        assertTrue(picked.zipWithNext().all { (a, b) -> a.first < b.first })
+    }
+
+    @Test
     fun torsoMedian_ignoresNulls() {
         val analyzer = PostureAnalyzer(config)
         analyzer.beginWindow()

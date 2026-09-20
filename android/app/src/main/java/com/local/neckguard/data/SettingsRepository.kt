@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.local.neckguard.pose.AnalyzerConfig
 import com.local.neckguard.pose.GeometryConfig
@@ -36,7 +37,21 @@ data class Settings(
     val baselineDeg: Float? = null,
     /** 调试用：每个有效采样窗都保存快照。 */
     val saveEveryWindowSnapshot: Boolean = false,
+    /** 局域网电脑接收端地址，例如 http://192.168.1.10:8765，空表示关闭。 */
+    val pcEndpoint: String = "",
+    /** 可选口令，随请求头 X-Neck-Token 发送。 */
+    val pcToken: String = "",
+    /** 是否把事件上报到电脑。 */
+    val pcEnabled: Boolean = false,
 ) {
+    /** 规范化后的电脑端根地址（去掉末尾斜杠、补 http://），未配置返回 null。 */
+    val pcBaseUrl: String?
+        get() {
+            val raw = pcEndpoint.trim().trimEnd('/')
+            if (raw.isEmpty()) return null
+            return if (raw.startsWith("http://") || raw.startsWith("https://")) raw else "http://$raw"
+        }
+
     fun toAnalyzerConfig(): AnalyzerConfig = AnalyzerConfig(
         absoluteThresholdDeg = absoluteThresholdDeg,
         calibrationDeltaDeg = calibrationDeltaDeg,
@@ -65,6 +80,9 @@ class SettingsRepository(private val context: Context) {
         val MAX_SHOULDER_OFFSET = floatPreferencesKey("max_shoulder_offset_ratio")
         val BASELINE = floatPreferencesKey("baseline_deg")
         val SAVE_EVERY_WINDOW = booleanPreferencesKey("save_every_window_snapshot")
+        val PC_ENDPOINT = stringPreferencesKey("pc_endpoint")
+        val PC_TOKEN = stringPreferencesKey("pc_token")
+        val PC_ENABLED = booleanPreferencesKey("pc_enabled")
     }
 
     val settings: Flow<Settings> = context.settingsStore.data.map { p ->
@@ -83,6 +101,9 @@ class SettingsRepository(private val context: Context) {
             maxShoulderOffsetRatio = p[Keys.MAX_SHOULDER_OFFSET] ?: d.maxShoulderOffsetRatio,
             baselineDeg = p[Keys.BASELINE],
             saveEveryWindowSnapshot = p[Keys.SAVE_EVERY_WINDOW] ?: d.saveEveryWindowSnapshot,
+            pcEndpoint = p[Keys.PC_ENDPOINT] ?: d.pcEndpoint,
+            pcToken = p[Keys.PC_TOKEN] ?: d.pcToken,
+            pcEnabled = p[Keys.PC_ENABLED] ?: d.pcEnabled,
         )
     }
 
@@ -104,6 +125,9 @@ class SettingsRepository(private val context: Context) {
             p[Keys.COOLDOWN_MIN] = new.cooldownMin
             p[Keys.MAX_SHOULDER_OFFSET] = new.maxShoulderOffsetRatio
             p[Keys.SAVE_EVERY_WINDOW] = new.saveEveryWindowSnapshot
+            p[Keys.PC_ENDPOINT] = new.pcEndpoint
+            p[Keys.PC_TOKEN] = new.pcToken
+            p[Keys.PC_ENABLED] = new.pcEnabled
             val baseline = new.baselineDeg
             if (baseline == null) p.remove(Keys.BASELINE) else p[Keys.BASELINE] = baseline
         }
@@ -127,6 +151,9 @@ class SettingsRepository(private val context: Context) {
             maxShoulderOffsetRatio = p[Keys.MAX_SHOULDER_OFFSET] ?: d.maxShoulderOffsetRatio,
             baselineDeg = p[Keys.BASELINE],
             saveEveryWindowSnapshot = p[Keys.SAVE_EVERY_WINDOW] ?: d.saveEveryWindowSnapshot,
+            pcEndpoint = p[Keys.PC_ENDPOINT] ?: d.pcEndpoint,
+            pcToken = p[Keys.PC_TOKEN] ?: d.pcToken,
+            pcEnabled = p[Keys.PC_ENABLED] ?: d.pcEnabled,
         )
     }
 }
