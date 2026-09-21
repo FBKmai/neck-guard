@@ -115,6 +115,18 @@ python send_test_event.py --token test123 --ping   :: 只测连通性
 
 ## 接口
 
+事件类型与提醒方式：
+
+| type | 含义 | 电脑端表现 |
+|---|---|---|
+| `ALERT` | 过了提醒冷却的前倾 | 弹通知 + 响铃 |
+| `CONFIRMED` | 冷却期内仍在前倾 | 弹通知，不响铃 |
+| `RECOVERED` | 坐正恢复 | 弹通知，不响铃 |
+| `TEST` | 设置页发的测试事件 | 弹通知 + 响铃 |
+
+只有 `ALERT` 和 `TEST` 会响铃。长时间低头时会持续收到「仍在前倾」的静音通知，
+既不漏掉状态，也不会每隔几秒就被铃声打断。响铃间隔由 App 设置页的「提醒冷却」控制，默认 10 分钟。
+
 - `GET /api/ping` 返回 `{"ok": true, "name": "neck-receiver", "version": "1"}`
 - `POST /api/posture/events`，`multipart/form-data`，字段 `event`（JSON）与可选 `snapshot`（JPEG），请求头 `X-Neck-Token`
 - 返回 200 `{"ok": true}`；密钥不匹配 401；解析失败 400

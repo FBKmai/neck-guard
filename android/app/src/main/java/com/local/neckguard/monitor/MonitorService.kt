@@ -506,11 +506,21 @@ class MonitorService : LifecycleService() {
                 verdict = s.verdict.name,
             )
             eventLog.append(event)
+            // 通知与电脑上报都用中位数代表帧，多帧留在 App 内查看
+            val primary = windowSnapshot ?: badFrameFiles.firstOrNull()
             if (outcome.shouldNotify) {
-                // 通知与电脑上报都用中位数代表帧，多帧留在 App 内查看
-                val primary = windowSnapshot ?: badFrameFiles.firstOrNull()
+                // 过了冷却：手机弹通知 + 电脑告警响铃
                 sink?.deliver(event, primary)
                 MonitorBus.update { it.copy(alertsSent = it.alertsSent + 1, lastSnapshotPath = primary?.absolutePath) }
+            } else {
+                // 冷却期内的确认前倾：只发电脑（弹通知不响铃），手机侧保持安静，
+                // 这样长时间低头能持续看到提示，又不会每个确认窗都被铃声打断。
+                try {
+                    pcSink?.deliver(event, primary)
+                } catch (e: Exception) {
+                    Log.w(TAG, "deliver confirmed to pc failed", e)
+                }
+                MonitorBus.update { it.copy(lastSnapshotPath = primary?.absolutePath) }
             }
         }
         notifier.updateStatus(statusText())
