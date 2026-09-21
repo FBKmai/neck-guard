@@ -144,14 +144,7 @@ class MjpegServer(
 
     private fun rejectBusy(socket: Socket) {
         try {
-            socket.use {
-                it.getOutputStream().write(
-                    httpHeader(503, "text/plain; charset=utf-8", "连接数已达上限 $MAX_CLIENTS".toByteArray(Charsets.UTF_8).size)
-                        .toByteArray(Charsets.UTF_8),
-                )
-                it.getOutputStream().write("连接数已达上限 $MAX_CLIENTS".toByteArray(Charsets.UTF_8))
-                it.getOutputStream().flush()
-            }
+            socket.use { writeText(it, 503, "连接数已达上限 $MAX_CLIENTS") }
         } catch (_: Exception) {
         }
     }
@@ -251,7 +244,11 @@ class MjpegServer(
                 if (!running.get() || current == null) null else current to frameSeq
             }
             if (!running.get()) return
-            if (taken == null) continue
+            if (taken == null) {
+                // stop() 会把 latestJpeg 清空并推进不了 seq，这里同步一下避免空转
+                lastSeq = synchronized(frameLock) { frameSeq }
+                continue
+            }
             val frame = taken.first
             lastSeq = taken.second
             out.write(

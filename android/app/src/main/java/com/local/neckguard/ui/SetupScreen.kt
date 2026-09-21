@@ -35,6 +35,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.camera.view.PreviewView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.local.neckguard.data.DetectionMode
+import com.local.neckguard.data.Settings
 import com.local.neckguard.data.SettingsRepository
 import com.local.neckguard.monitor.MonitorBus
 import com.local.neckguard.monitor.MonitorService
@@ -53,7 +54,7 @@ fun SetupScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     val monitor by MonitorBus.state.collectAsStateWithLifecycle()
-    val settings by settingsRepo.settings.collectAsStateWithLifecycle(initialValue = null)
+    val settings by settingsRepo.settings.collectAsState(initial = Settings())
 
     if (monitor.running) {
         // 服务占用相机时不开预览，避免两边争抢
@@ -143,7 +144,7 @@ fun SetupScreen(
                 }
             }
 
-            val streamMode = settings?.detectionMode == DetectionMode.PC_STREAM
+            val streamMode = settings.detectionMode == DetectionMode.PC_STREAM
             if (streamMode) {
                 Card {
                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {

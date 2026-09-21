@@ -263,7 +263,11 @@ class MonitorService : LifecycleService() {
             targetFps = { settings.streamFps },
         )
         if (!server.start()) {
-            fail("推流端口 ${settings.streamPort} 占用失败：${server.lastError ?: "未知原因"}，请换一个端口")
+            // 端口被别的 App 占着，或上一次推流刚停还没释放干净
+            fail(
+                "推流端口 ${settings.streamPort} 打不开：${server.lastError ?: "未知原因"}。" +
+                    "请在设置页换一个端口，或稍等几秒重试",
+            )
             return
         }
         mjpegServer = server
