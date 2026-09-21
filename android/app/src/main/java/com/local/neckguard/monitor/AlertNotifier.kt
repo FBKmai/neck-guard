@@ -91,6 +91,41 @@ class AlertNotifier(private val context: Context) {
         }
     }
 
+    /**
+     * 恢复端正的提醒：静音、低优先级、可自动消失，同时收掉还挂着的前倾提醒。
+     * 目的是让用户知道"系统看到你坐正了"，而不是再打扰一次。
+     */
+    fun postRecovered(neckDeg: Float?, forwardHeadMillis: Long) {
+        try {
+            NotificationManagerCompat.from(context).cancel(ALERT_ID)
+        } catch (e: Exception) {
+            Log.w(TAG, "cancel alert failed", e)
+        }
+        if (!canPost()) return
+        val seconds = (forwardHeadMillis / 1000L).coerceAtLeast(0L)
+        val body = buildString {
+            append("颈部倾角 ")
+            append(neckDeg?.let { String.format(Locale.US, "%.1f°", it) } ?: "--")
+            if (seconds > 0) append("，前倾持续 ").append(seconds).append(" 秒")
+            append("。")
+        }
+        val n = NotificationCompat.Builder(context, NeckGuardApp.CHANNEL_STATUS)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("已恢复端正坐姿")
+            .setContentText(body)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setSilent(true)
+            .setAutoCancel(true)
+            .setTimeoutAfter(RECOVERED_TIMEOUT_MILLIS)
+            .setContentIntent(openAppIntent(MainActivity.EXTRA_SCREEN_MONITOR))
+            .build()
+        try {
+            NotificationManagerCompat.from(context).notify(RECOVERED_ID, n)
+        } catch (e: SecurityException) {
+            Log.w(TAG, "notify recovered denied", e)
+        }
+    }
+
     fun postError(message: String) {
         if (!canPost()) return
         val n = NotificationCompat.Builder(context, NeckGuardApp.CHANNEL_ALERT)
@@ -136,6 +171,8 @@ class AlertNotifier(private val context: Context) {
         const val STATUS_ID = 1001
         const val ALERT_ID = 2001
         const val ERROR_ID = 3001
+        const val RECOVERED_ID = 4001
+        private const val RECOVERED_TIMEOUT_MILLIS = 30_000L
         private const val REQ_OPEN = 10
         private const val REQ_STOP = 11
     }

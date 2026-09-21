@@ -189,6 +189,54 @@ class PostureAnalyzerTest {
     }
 
     @Test
+    fun markRecovered_clearsForwardHeadAndStreak_butKeepsCooldown() {
+        val analyzer = PostureAnalyzer(config)
+        analyzer.runWindow(0L, 45f, 46f, 47f)
+        val notify = analyzer.runWindow(1_000L, 45f, 46f, 47f)
+        assertTrue(notify.shouldNotify)
+        assertTrue(analyzer.inForwardHead)
+        assertEquals(2, analyzer.badStreak)
+
+        analyzer.markRecovered()
+        assertFalse(analyzer.inForwardHead)
+        assertEquals(0, analyzer.badStreak)
+        assertEquals(1_000L, analyzer.lastNotifyAt!!.toLong())
+        // 冷却仍在：恢复后立刻再连续两窗前倾只确认不通知
+        analyzer.runWindow(2_000L, 45f, 46f, 47f)
+        val again = analyzer.runWindow(3_000L, 45f, 46f, 47f)
+        assertTrue(again.confirmed)
+        assertFalse(again.shouldNotify)
+    }
+
+    @Test
+    fun canNotify_respectsCooldown() {
+        val analyzer = PostureAnalyzer(config)
+        assertTrue(analyzer.canNotify(0L))
+        analyzer.runWindow(0L, 45f, 46f, 47f)
+        analyzer.runWindow(1_000L, 45f, 46f, 47f)
+        assertFalse(analyzer.canNotify(5_000L))
+        assertTrue(analyzer.canNotify(11_000L))
+    }
+
+    @Test
+    fun exitThreshold_isThresholdMinusHysteresis() {
+        val analyzer = PostureAnalyzer(config)
+        assertEquals(36f, analyzer.exitThresholdDeg, 1e-6f)
+        analyzer.setBaseline(25f)
+        assertEquals(33f, analyzer.exitThresholdDeg, 1e-6f)
+    }
+
+    @Test
+    fun windowProgress_countsValidAndTotal() {
+        val analyzer = PostureAnalyzer(config)
+        analyzer.beginWindow()
+        assertEquals(0 to 0, analyzer.windowProgress())
+        analyzer.addFrame(FrameResult.Valid(measurement(20f)))
+        analyzer.addFrame(FrameResult.NoPerson)
+        assertEquals(1 to 2, analyzer.windowProgress())
+    }
+
+    @Test
     fun torsoMedian_ignoresNulls() {
         val analyzer = PostureAnalyzer(config)
         analyzer.beginWindow()

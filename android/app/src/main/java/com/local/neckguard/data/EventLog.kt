@@ -13,8 +13,14 @@ enum class EventType {
     ALERT,
     /** 已确认前倾但处于冷却期，只记录。 */
     CONFIRMED,
-    /** 普通采样窗（仅在调试开关打开时记录）。 */
+    /** 一个确认窗的结果。 */
     WINDOW,
+    /** 巡检发现疑似前倾，进入确认模式。 */
+    TRIGGER,
+    /** 前倾后重新坐正。 */
+    RECOVERED,
+    /** 相机绑定失败或断流重连。 */
+    CAMERA,
     ERROR,
     INFO,
 }
@@ -30,6 +36,8 @@ data class PostureEvent(
     val snapshotPaths: List<String> = emptyList(),
     /** WINDOW 事件的判定：GOOD / BAD / INVALID。 */
     val verdict: String? = null,
+    /** RECOVERED 事件：本次前倾从确认到恢复持续了多久。 */
+    val forwardHeadMillis: Long? = null,
 ) {
     val snapshotPath: String?
         get() = snapshotPaths.firstOrNull()
@@ -42,6 +50,7 @@ data class PostureEvent(
         thresholdDeg?.let { put("threshold", it.toDouble()) }
         message?.let { put("message", it) }
         verdict?.let { put("verdict", it) }
+        forwardHeadMillis?.let { put("forwardHeadMs", it) }
         if (snapshotPaths.isNotEmpty()) put("snapshots", JSONArray(snapshotPaths))
     }
 
@@ -62,6 +71,7 @@ data class PostureEvent(
                 message = if (json.has("message")) json.getString("message") else null,
                 snapshotPaths = paths,
                 verdict = if (json.has("verdict")) json.getString("verdict") else null,
+                forwardHeadMillis = if (json.has("forwardHeadMs")) json.getLong("forwardHeadMs") else null,
             )
         }
     }

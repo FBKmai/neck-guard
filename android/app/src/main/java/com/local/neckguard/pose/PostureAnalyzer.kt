@@ -184,6 +184,32 @@ class PostureAnalyzer(config: AnalyzerConfig = AnalyzerConfig()) {
         lastNotifyAt = null
     }
 
+    /**
+     * 逐帧恢复判定通过后调用：退出前倾、清连续计数，但**保留冷却**（lastNotifyAt）。
+     * 与 resetState 的区别就在冷却：恢复后短时间内再次前倾仍应受冷却压制，只记录不重复提醒。
+     */
+    @Synchronized
+    fun markRecovered() {
+        inForwardHead = false
+        badStreak = 0
+    }
+
+    /** 距上次通知是否已超过冷却时间。从未通知过返回 true。 */
+    @Synchronized
+    fun canNotify(nowMillis: Long): Boolean =
+        lastNotifyAt?.let { nowMillis - it >= config.cooldownMillis } ?: true
+
+    /** 退出前倾的角度线 = 阈值 - 迟滞。低于它才算恢复端正。 */
+    val exitThresholdDeg: Float
+        get() {
+            val cfg = config
+            return thresholdFor(baselineDeg, cfg) - cfg.hysteresisDeg
+        }
+
+    /** 当前窗进度（有效帧数, 总帧数），供 UI 显示。 */
+    @Synchronized
+    fun windowProgress(): Pair<Int, Int> = validFrames.size to totalFrames
+
     companion object {
         const val MAX_BAD_FRAMES = 6
 

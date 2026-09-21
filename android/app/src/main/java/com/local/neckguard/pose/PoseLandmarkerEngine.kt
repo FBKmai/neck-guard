@@ -31,21 +31,38 @@ class PoseFrame(
  * - submit 在 CameraX 分析线程调用，做 ImageProxy -> Bitmap（旋转）-> MPImage -> detectAsync。
  * - 结果回调在 MediaPipe 内部串行队列上，通过 onFrame 上抛。
  * - 所有异常通过 onError 上抛，不抛出到调用方。
+ *
+ * 节流间隔可在运行时切换（巡检 700 ms / 确认 125 ms），用 AtomicLong 保证跨线程可见。
  */
 class PoseLandmarkerEngine(
     private val context: Context,
     private val onFrame: (PoseFrame) -> Unit,
     private val onError: (Throwable) -> Unit,
-    private val minIntervalMillis: Long = 100L,
-    private val useGpu: Boolean = false,
+    initialIntervalMillis: Long = 125L,
+    val useGpu: Boolean = false,
 ) {
     private var landmarker: PoseLandmarker? = null
     private val closed = AtomicBoolean(false)
     private val lastSubmitAt = AtomicLong(0L)
     private val lastTimestamp = AtomicLong(0L)
     private val inFlight = AtomicLong(0L)
+    private val minIntervalMillis = AtomicLong(initialIntervalMillis.coerceAtLeast(MIN_INTERVAL_MILLIS))
 
-    /** 同步加载模型；失败时调用 onError 并返回 false。 */
+    /** 送入的帧数与被节流丢弃的帧数，仅用于诊断。 */
+    private val submittedCount = AtomicLong(0L)
+    private val droppedCount = AtomicLong(0L)
+
+    val delegateName: String get() = if (useGpu) "GPU" else "CPU"
+    val isGpu: Boolean get() = useGpu && landmarker != null
+    val submitted: Long get() = submittedCount.get()
+    val dropped: Long get() = droppedCount.get()
+
+    /** 运行时切换送帧间隔。巡检与确认模式切换时由调用方触发。 */
+    fun setMinIntervalMillis(millis: Long) {
+        minIntervalMillis.set(millis.coerceAtLeast(MIN_INTERVAL_MILLIS))
+    }
+
+    /** 同步加载模型；失败时调用 onError 并返回 false，由调用方决定是否回退。 */
     fun start(): Boolean {
         if (landmarker != null) return true
         return try {
@@ -67,26 +84,34 @@ class PoseLandmarkerEngine(
             closed.set(false)
             true
         } catch (e: Throwable) {
-            Log.e(TAG, "load pose model failed", e)
-            onError(IllegalStateException("姿态模型加载失败: ${e.message}", e))
+            Log.e(TAG, "load pose model failed (delegate=$delegateName)", e)
+            onError(IllegalStateException("姿态模型加载失败($delegateName): ${e.message}", e))
             false
         }
     }
 
     /**
      * 送入一帧。无论成功与否都会关闭 imageProxy。
-     * 按 minIntervalMillis 节流，避免 JPEG 压缩与推理把 CPU 打满。
+     * 节流判断在 toBitmap 之前，被丢弃的帧不做任何像素转换。
      */
     fun submit(imageProxy: ImageProxy) {
         try {
             val lm = landmarker
             if (lm == null || closed.get()) return
             val now = SystemClock.uptimeMillis()
-            if (now - lastSubmitAt.get() < minIntervalMillis) return
+            val interval = minIntervalMillis.get()
+            if (now - lastSubmitAt.get() < interval) {
+                droppedCount.incrementAndGet()
+                return
+            }
             // 有一帧在推理时不再堆积，KEEP_ONLY_LATEST 会丢弃中间帧；
-            // 若 MediaPipe 内部丢帧导致回调缺失，超过 STALL_MILLIS 后强制复位，避免永久卡死
+            // 若 MediaPipe 内部丢帧导致回调缺失，超过停滞阈值后强制复位，避免永久卡死
             if (inFlight.get() > 0) {
-                if (now - lastSubmitAt.get() < STALL_MILLIS) return
+                val stallMillis = maxOf(STALL_MILLIS, interval * 3)
+                if (now - lastSubmitAt.get() < stallMillis) {
+                    droppedCount.incrementAndGet()
+                    return
+                }
                 Log.w(TAG, "inference stalled, resetting in-flight counter")
                 inFlight.set(0L)
             }
@@ -98,10 +123,12 @@ class PoseLandmarkerEngine(
             val ts = maxOf(now, lastTimestamp.get() + 1)
             lastTimestamp.set(ts)
             inFlight.incrementAndGet()
+            submittedCount.incrementAndGet()
             try {
                 lm.detectAsync(mpImage, ts)
             } catch (e: Throwable) {
                 inFlight.decrementAndGet()
+                bitmap.recycle()
                 throw e
             }
         } catch (e: Throwable) {
@@ -157,8 +184,12 @@ class PoseLandmarkerEngine(
         private const val TAG = "PoseEngine"
         const val MODEL_ASSET = "pose_landmarker_lite.task"
         private const val STALL_MILLIS = 1_500L
+        const val MIN_INTERVAL_MILLIS = 30L
 
-        /** 把分析帧按 rotationDegrees 旋转到正向（与 targetRotation 对齐）。 */
+        /**
+         * 把分析帧按 rotationDegrees 旋转到正向（与 targetRotation 对齐）。
+         * ImageProxy.toBitmap() 支持 YUV_420_888 / RGBA_8888 / JPEG，由 CameraX 原生转换。
+         */
         fun toUprightBitmap(imageProxy: ImageProxy): Bitmap {
             val raw = imageProxy.toBitmap()
             val rotation = imageProxy.imageInfo.rotationDegrees

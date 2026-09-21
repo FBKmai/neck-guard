@@ -80,7 +80,7 @@ fun MonitorScreen(eventLog: EventLog, modifier: Modifier = Modifier) {
     }
 
     var events by remember { mutableStateOf<List<PostureEvent>>(emptyList()) }
-    LaunchedEffect(monitor.windowsRun, monitor.alertsSent, monitor.lastError) {
+    LaunchedEffect(monitor.windowsRun, monitor.alertsSent, monitor.lastError, monitor.triggers, monitor.recoveries, monitor.cameraRebinds) {
         events = eventLog.readLatest(200)
     }
 
@@ -92,7 +92,10 @@ fun MonitorScreen(eventLog: EventLog, modifier: Modifier = Modifier) {
         events.filter { it.type == EventType.ALERT || it.type == EventType.CONFIRMED }
     }
     val otherEvents = remember(events) {
-        events.filter { it.type == EventType.ERROR || it.type == EventType.INFO }
+        events.filter {
+            it.type == EventType.ERROR || it.type == EventType.INFO ||
+                it.type == EventType.TRIGGER || it.type == EventType.RECOVERED || it.type == EventType.CAMERA
+        }
     }
     val shownOthers = if (showAllOthers) otherEvents else otherEvents.take(OTHER_COLLAPSED_COUNT)
 
@@ -124,7 +127,7 @@ fun MonitorScreen(eventLog: EventLog, modifier: Modifier = Modifier) {
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("最近采样", style = MaterialTheme.typography.titleMedium)
+                Text("最近确认窗", style = MaterialTheme.typography.titleMedium)
                 TextButton(onClick = {
                     scope.launch {
                         eventLog.clear()
@@ -135,7 +138,7 @@ fun MonitorScreen(eventLog: EventLog, modifier: Modifier = Modifier) {
         }
         item {
             if (windowEvents.isEmpty()) {
-                Text("暂无采样记录", style = MaterialTheme.typography.bodyMedium)
+                Text("暂无确认窗记录", style = MaterialTheme.typography.bodyMedium)
             } else {
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     itemsIndexed(
@@ -206,17 +209,23 @@ private fun StatusCard(monitor: MonitorState, now: Long) {
             monitor.startedAtMillis?.let { started ->
                 Text("启动于 ${TIME_FMT.format(Date(started))}，已运行 ${durationText(now - started)}")
             }
+            if (monitor.running && monitor.forwardHead) {
+                Text(
+                    "前倾中，等待恢复",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.titleSmall,
+                )
+            }
             if (monitor.running) {
-                val next = monitor.nextSampleAtMillis
-                val text = when {
-                    monitor.phase == MonitorPhase.SAMPLING -> "正在采样"
-                    next == null -> "等待调度"
-                    else -> {
-                        val remain = ((next - now) / 1000L).coerceAtLeast(0L)
-                        "下次采样：${remain} 秒后"
-                    }
-                }
-                Text(text)
+                Text(
+                    buildString {
+                        append("当前 ").append(fmtDeg(monitor.lastNeckDeg))
+                        monitor.lastFrameResult?.let { append("  ").append(it) }
+                        if (monitor.inferenceMillis > 0) append("  ").append(monitor.inferenceMillis).append(" ms")
+                        append("  已分析 ").append(monitor.framesAnalyzed).append(" 帧")
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                )
             }
             Text(
                 buildString {
@@ -226,7 +235,22 @@ private fun StatusCard(monitor: MonitorState, now: Long) {
                     append(monitor.baselineDeg?.let { fmtDeg(it) } ?: "未校准")
                 },
             )
-            Text("采样 ${monitor.windowsRun} 次，无效 ${monitor.invalidWindows} 次，提醒 ${monitor.alertsSent} 次，连续前倾 ${monitor.badStreak} 窗")
+            Text(
+                "确认窗 ${monitor.windowsRun} 次，无效 ${monitor.invalidWindows} 次，触发 ${monitor.triggers} 次，" +
+                    "恢复 ${monitor.recoveries} 次，提醒 ${monitor.alertsSent} 次，连续前倾 ${monitor.badStreak} 窗",
+            )
+            if (monitor.lens != null || monitor.delegate != null) {
+                Text(
+                    buildString {
+                        monitor.lens?.let { append(it) }
+                        monitor.delegate?.let { append("  ·  ").append(it) }
+                        monitor.analysisSize?.let { append("  ·  ").append(it) }
+                        if (monitor.cameraRebinds > 0) append("  ·  重连 ").append(monitor.cameraRebinds).append(" 次")
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             monitor.lastError?.let {
                 Text("最近异常：$it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
             }
@@ -239,12 +263,12 @@ private fun LastSampleCard(monitor: MonitorState) {
     val s = monitor.lastSummary
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text("上次采样", style = MaterialTheme.typography.titleSmall)
+            Text("上次确认窗", style = MaterialTheme.typography.titleSmall)
             if (s == null) {
-                Text("尚未采样")
+                Text("尚未进入确认")
                 return@Column
             }
-            monitor.lastSampleAtMillis?.let { Text("时间 ${TIME_FMT.format(Date(it))}") }
+            monitor.lastWindowAtMillis?.let { Text("时间 ${TIME_FMT.format(Date(it))}") }
             val verdictColor = when (s.verdict) {
                 WindowVerdict.BAD -> MaterialTheme.colorScheme.error
                 WindowVerdict.GOOD -> MaterialTheme.colorScheme.primary
@@ -297,7 +321,9 @@ private fun AlertEventRow(event: PostureEvent, onOpen: (Int) -> Unit) {
         val typeColor = when (event.type) {
             EventType.ALERT -> MaterialTheme.colorScheme.error
             EventType.CONFIRMED -> MaterialTheme.colorScheme.tertiary
-            EventType.ERROR -> MaterialTheme.colorScheme.error
+            EventType.ERROR, EventType.CAMERA -> MaterialTheme.colorScheme.error
+            EventType.TRIGGER -> MaterialTheme.colorScheme.tertiary
+            EventType.RECOVERED -> MaterialTheme.colorScheme.primary
             EventType.WINDOW, EventType.INFO -> MaterialTheme.colorScheme.onSurfaceVariant
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -336,7 +362,9 @@ private fun AlertEventRow(event: PostureEvent, onOpen: (Int) -> Unit) {
 @Composable
 private fun OtherEventRow(event: PostureEvent) {
     val color = when (event.type) {
-        EventType.ERROR -> MaterialTheme.colorScheme.error
+        EventType.ERROR, EventType.CAMERA -> MaterialTheme.colorScheme.error
+        EventType.RECOVERED -> MaterialTheme.colorScheme.primary
+        EventType.TRIGGER -> MaterialTheme.colorScheme.tertiary
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
     Row(
@@ -457,8 +485,9 @@ private fun decodeFile(path: String, sampleSize: Int): Bitmap? {
 private fun phaseText(phase: MonitorPhase): String = when (phase) {
     MonitorPhase.IDLE -> "空闲"
     MonitorPhase.STARTING -> "启动中"
-    MonitorPhase.WAITING -> "等待下次采样"
-    MonitorPhase.SAMPLING -> "采样中"
+    MonitorPhase.PATROL -> "巡检中"
+    MonitorPhase.CONFIRMING -> "确认中"
+    MonitorPhase.CAMERA_LOST -> "相机丢失，重连中"
     MonitorPhase.ERROR -> "异常"
 }
 
@@ -483,7 +512,10 @@ private fun verdictColor(v: String): Color = when (v) {
 private fun eventTypeText(t: EventType): String = when (t) {
     EventType.ALERT -> "已提醒"
     EventType.CONFIRMED -> "已确认(冷却中)"
-    EventType.WINDOW -> "采样"
+    EventType.WINDOW -> "确认窗"
+    EventType.TRIGGER -> "进入确认"
+    EventType.RECOVERED -> "已恢复"
+    EventType.CAMERA -> "相机"
     EventType.ERROR -> "错误"
     EventType.INFO -> "信息"
 }

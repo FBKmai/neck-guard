@@ -10,6 +10,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -32,14 +34,21 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.platform.LocalContext
+import androidx.camera.lifecycle.ProcessCameraProvider
+import com.local.neckguard.camera.AnalysisResolution
+import com.local.neckguard.camera.CameraLens
+import com.local.neckguard.camera.CameraLensResolver
 import com.local.neckguard.data.EventLog
 import com.local.neckguard.data.EventType
 import com.local.neckguard.data.PostureEvent
 import com.local.neckguard.monitor.SnapshotStore
 import com.local.neckguard.report.PcSink
+import com.local.neckguard.data.RecoveredNotify
 import com.local.neckguard.data.Settings
 import com.local.neckguard.data.SettingsRepository
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Locale
 
 @Composable
@@ -52,6 +61,7 @@ fun SettingsScreen(
     val scope = rememberCoroutineScope()
     val settings by settingsRepo.settings.collectAsState(initial = Settings())
     var message by remember { mutableStateOf<String?>(null) }
+    var diagnostics by remember { mutableStateOf<List<String>?>(null) }
 
     fun save(transform: (Settings) -> Settings) {
         scope.launch {
@@ -70,34 +80,71 @@ fun SettingsScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("采样调度", style = MaterialTheme.typography.titleMedium)
+        Text("连续检测", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "相机常开：平时低帧率巡检，发现疑似前倾立即切到高帧率确认，连续多个确认窗判为前倾才提醒。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         IntField(
-            label = "采样间隔（秒）",
-            hint = "两次采样之间的基础等待时间，默认 45，最小 5",
-            value = settings.intervalSec,
-            validate = { it >= 5 },
-            onSave = { v -> save { it.copy(intervalSec = v) } },
+            label = "巡检间隔（毫秒）",
+            hint = "平时每隔多久分析一帧，默认 700（约 1.4 fps），越小越灵敏也越费电",
+            value = settings.slowIntervalMillis,
+            validate = { it in 200..5000 },
+            onSave = { v -> save { it.copy(slowIntervalMillis = v) } },
             onInvalid = { message = it },
         )
         IntField(
-            label = "随机抖动（秒）",
-            hint = "在间隔上叠加正负随机量，实现不定时采样，默认 15，0 表示固定间隔",
-            value = settings.jitterSec,
-            validate = { it >= 0 },
-            onSave = { v -> save { it.copy(jitterSec = v) } },
+            label = "确认间隔（毫秒）",
+            hint = "确认模式下每隔多久分析一帧，默认 125（约 8 fps）",
+            value = settings.fastIntervalMillis,
+            validate = { it in 60..1000 },
+            onSave = { v -> save { it.copy(fastIntervalMillis = v) } },
             onInvalid = { message = it },
         )
         IntField(
-            label = "采样窗时长（秒）",
-            hint = "每次打开相机连续分析的时间，默认 3，范围 1 到 15",
-            value = settings.windowSec,
+            label = "确认窗时长（秒）",
+            hint = "每个确认窗持续多久，默认 3，范围 1 到 15",
+            value = settings.confirmWindowSec,
             validate = { it in 1..15 },
-            onSave = { v -> save { it.copy(windowSec = v) } },
+            onSave = { v -> save { it.copy(confirmWindowSec = v) } },
+            onInvalid = { message = it },
+        )
+        IntField(
+            label = "触发帧数",
+            hint = "巡检中连续多少帧超过阈值就进入确认，默认 2",
+            value = settings.triggerFrames,
+            validate = { it in 1..10 },
+            onSave = { v -> save { it.copy(triggerFrames = v) } },
+            onInvalid = { message = it },
+        )
+        IntField(
+            label = "恢复帧数",
+            hint = "前倾后连续多少帧低于阈值减迟滞才算恢复端正，默认 5",
+            value = settings.recoverFrames,
+            validate = { it in 1..30 },
+            onSave = { v -> save { it.copy(recoverFrames = v) } },
+            onInvalid = { message = it },
+        )
+        IntField(
+            label = "重新确认间隔（秒）",
+            hint = "确认前倾后至少隔多久才再次进入确认，默认 30",
+            value = settings.retriggerHoldSec,
+            validate = { it in 0..600 },
+            onSave = { v -> save { it.copy(retriggerHoldSec = v) } },
+            onInvalid = { message = it },
+        )
+        IntField(
+            label = "无效窗上限",
+            hint = "确认模式下连续多少个无效窗（看不到人）就退回巡检，默认 2",
+            value = settings.maxInvalidWindows,
+            validate = { it in 1..10 },
+            onSave = { v -> save { it.copy(maxInvalidWindows = v) } },
             onInvalid = { message = it },
         )
         IntField(
             label = "有效帧下限（帧）",
-            hint = "一个采样窗内有效帧少于此值视为无效窗，默认 8",
+            hint = "一个确认窗内有效帧少于此值视为无效窗，默认 8",
             value = settings.minValidFrames,
             validate = { it >= 1 },
             onSave = { v -> save { it.copy(minValidFrames = v) } },
@@ -147,7 +194,7 @@ fun SettingsScreen(
         )
         IntField(
             label = "连续前倾窗数",
-            hint = "连续多少个采样窗判为前倾才提醒，默认 2",
+            hint = "连续多少个确认窗判为前倾才提醒，默认 2",
             value = settings.consecutiveBadWindows,
             validate = { it >= 1 },
             onSave = { v -> save { it.copy(consecutiveBadWindows = v) } },
@@ -244,23 +291,64 @@ fun SettingsScreen(
         }
 
         HorizontalDivider()
-        Text("相机与调试", style = MaterialTheme.typography.titleMedium)
-        SwitchRow(
-            label = "使用前置摄像头",
-            hint = "关闭则使用后置摄像头，默认开启",
-            checked = settings.useFrontCamera,
-            onChange = { v -> save { it.copy(useFrontCamera = v) } },
-        )
-        SwitchRow(
-            label = "每个采样窗都保存截图",
-            hint = "调试用，会显著增加存储占用与耗电，默认关闭",
-            checked = settings.saveEveryWindowSnapshot,
-            onChange = { v -> save { it.copy(saveEveryWindowSnapshot = v) } },
+        Text("恢复提醒", style = MaterialTheme.typography.titleMedium)
+        ChoiceRow(
+            label = "坐正后提醒到",
+            hint = "前倾后重新坐正时的提示，手机端为静音通知，电脑端需开启上报",
+            options = RecoveredNotify.entries.toList(),
+            selected = settings.recoveredNotify,
+            optionLabel = { it.label },
+            onSelect = { v -> save { it.copy(recoveredNotify = v) } },
         )
 
         HorizontalDivider()
+        Text("相机与性能", style = MaterialTheme.typography.titleMedium)
+        ChoiceRow(
+            label = "镜头",
+            hint = "超广角适合近距离拍到完整上半身；部分机型不向第三方开放，会自动退回普通后摄",
+            options = CameraLens.entries.toList(),
+            selected = settings.cameraLens,
+            optionLabel = { it.label },
+            onSelect = { v -> save { it.copy(cameraLens = v) } },
+        )
+        ChoiceRow(
+            label = "分析分辨率",
+            hint = "越高截图越清晰，转换与编码开销也越大，默认 640x480",
+            options = AnalysisResolution.entries.toList(),
+            selected = settings.analysisResolution,
+            optionLabel = { it.label },
+            onSelect = { v -> save { it.copy(analysisResolution = v) } },
+        )
+        SwitchRow(
+            label = "GPU 加速",
+            hint = "部分机型 GPU 委托不可用，失败会自动回退 CPU，默认关闭",
+            checked = settings.useGpu,
+            onChange = { v -> save { it.copy(useGpu = v) } },
+        )
+        OutlinedButton(
+            onClick = {
+                message = "正在读取相机信息"
+                scope.launch {
+                    diagnostics = withContext(Dispatchers.IO) {
+                        try {
+                            val provider = ProcessCameraProvider.getInstance(context).get()
+                            CameraLensResolver.diagnostics(context, provider).map { it.toLine() }
+                        } catch (e: Exception) {
+                            listOf("读取失败: " + (e.message ?: e::class.java.simpleName))
+                        }
+                    }
+                    message = null
+                }
+            },
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("相机信息") }
+
+        HorizontalDivider()
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = { save { Settings(baselineDeg = it.baselineDeg) } }, modifier = Modifier.weight(1f)) {
+            OutlinedButton(
+                onClick = { save { Settings(baselineDeg = it.baselineDeg, cameraLens = it.cameraLens) } },
+                modifier = Modifier.weight(1f),
+            ) {
                 Text("恢复默认")
             }
             OutlinedButton(
@@ -277,6 +365,61 @@ fun SettingsScreen(
             Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
         }
         Spacer(Modifier.height(24.dp))
+    }
+
+    diagnostics?.let { lines ->
+        AlertDialog(
+            onDismissRequest = { diagnostics = null },
+            confirmButton = { TextButton(onClick = { diagnostics = null }) { Text("关闭") } },
+            title = { Text("相机信息") },
+            text = {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        "标注为系统隐藏的镜头无法被第三方应用打开。若后置镜头的 zoom 下限小于 1，超广角可用。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (lines.isEmpty()) {
+                        Text("未读取到任何相机")
+                    } else {
+                        lines.forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
+                    }
+                }
+            },
+        )
+    }
+}
+
+/** 一排单选芯片，用于镜头、分辨率这类少量互斥选项。 */
+@Composable
+private fun <T> ChoiceRow(
+    label: String,
+    hint: String,
+    options: List<T>,
+    selected: T,
+    optionLabel: (T) -> String,
+    onSelect: (T) -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(label)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 4.dp)) {
+            options.forEach { option ->
+                FilterChip(
+                    selected = option == selected,
+                    onClick = { if (option != selected) onSelect(option) },
+                    label = { Text(optionLabel(option)) },
+                )
+            }
+        }
+        Text(
+            hint,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 4.dp, top = 2.dp),
+        )
     }
 }
 

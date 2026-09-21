@@ -89,7 +89,7 @@ fun SetupScreen(
                 result = live.result,
                 imageWidth = live.imageWidth,
                 imageHeight = live.imageHeight,
-                mirrored = live.useFrontCamera,
+                mirrored = live.mirrored,
                 modifier = Modifier.fillMaxSize(),
             )
             StatusBadge(live, modifier = Modifier.padding(12.dp))
@@ -127,7 +127,7 @@ fun SetupScreen(
                 Button(onClick = { controller.startCalibration() }, enabled = live.ready && !live.calibrating) { Text("校准") }
                 OutlinedButton(onClick = { controller.clearBaseline() }, enabled = live.baselineDeg != null) { Text("清除校准") }
                 TextButton(onClick = { controller.switchCamera(lifecycleOwner, previewView) }, enabled = live.ready) {
-                    Text(if (live.useFrontCamera) "切到后置" else "切到前置")
+                    Text("镜头：" + live.lens.label)
                 }
             }
 
@@ -177,10 +177,22 @@ private fun StatusBadge(live: LivePreviewController.LiveState, modifier: Modifie
             style = MaterialTheme.typography.bodyMedium,
         )
         Text(
-            String.format(Locale.US, "%.1f fps  %d ms", live.fps, live.inferenceMillis),
+            buildString {
+                append(String.format(Locale.US, "%.1f fps  %d ms", live.fps, live.inferenceMillis))
+                live.delegate?.let { append("  ").append(it) }
+                live.analysisSize?.let { append("  ").append(it) }
+            },
             color = Color.White,
             modifier = Modifier.padding(top = 4.dp).background(Color.Black.copy(alpha = 0.5f)).padding(horizontal = 8.dp, vertical = 2.dp),
             style = MaterialTheme.typography.labelSmall,
         )
+        live.lensDescription?.let { desc ->
+            Text(
+                desc,
+                color = Color.White,
+                modifier = Modifier.padding(top = 2.dp).background(Color.Black.copy(alpha = 0.5f)).padding(horizontal = 8.dp, vertical = 2.dp),
+                style = MaterialTheme.typography.labelSmall,
+            )
+        }
     }
 }

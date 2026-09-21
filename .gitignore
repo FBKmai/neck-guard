@@ -24,3 +24,6 @@ samples/
 Thumbs.db
 pc/snapshots/
 pc/__pycache__/
+
+# 下载回来的构建产物
+*.apk

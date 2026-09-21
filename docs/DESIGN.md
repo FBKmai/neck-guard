@@ -36,8 +36,8 @@ v1 的目标是验证"侧面摄像头 + 姿态关键点 + 角度阈值"这条路
 |------|------|------|
 | 姿态模型 | MediaPipe Tasks Vision `com.google.mediapipe:tasks-vision:1.0.0` | 33 个关键点，含耳 (7/8)、肩 (11/12)、髋 (23/24)，每点带 visibility |
 | 模型文件 | `pose_landmarker_lite.task`，约 5.8 MB | Gradle 任务在构建时下载到 assets，不提交二进制 |
-| 相机 | CameraX 1.5.3 | ImageAnalysis 取帧，`STRATEGY_KEEP_ONLY_LATEST`，640x480，RGBA_8888 |
-| 后台常驻 | `LifecycleService` + `foregroundServiceType="camera"` + partial WakeLock | Android 14+ 后台用相机的硬性要求 |
+| 相机 | CameraX 1.5.3 | ImageAnalysis 取帧，`STRATEGY_KEEP_ONLY_LATEST`，默认 640x480，YUV_420_888；镜头可选前置/后置/后置超广角 |
+| 后台常驻 | `LifecycleService` + `foregroundServiceType="camera"` + partial WakeLock | Android 14+ 后台用相机的硬性要求；v0.3 起相机常驻绑定 |
 | UI | Jetpack Compose，BOM 2026.06.01，Material 3 | 三个页面，PreviewView 用 AndroidView 包一层 |
 | 设置与事件 | DataStore Preferences + JSONL 事件文件 + JPEG 快照目录 | v1 不引入 Room |
 | 构建 | AGP 8.13.2 / Gradle 8.14.5 / Kotlin 2.2.21 / JDK 17；compileSdk 36，targetSdk 35，minSdk 26 | Kotlin 2.2.x 与 AGP 8.13 兼容性最稳 |
@@ -88,32 +88,33 @@ threshold = baseline == null ? 40° : clamp(baseline + 12°, 30°, 50°)
 
 - 迟滞：进入前倾需 `median > threshold`，退出前倾需 `median < threshold - 4°`，避免在临界值附近反复翻转。
 
-### 4.5 采样窗状态机
+### 4.5 双速检测状态机（v0.3）
 
-- 调度：每 `interval`（默认 45 s）加 `±jitter`（默认 15 s）的随机抖动打开一个 `window`（默认 3 s）采样窗，窗内约 15 到 30 帧。
-- 窗聚合：有效帧 `>= 8` 时取颈部角度中位数，否则窗结果为 `INVALID`，不改变连续计数。
-- 判定：按 4.4 的迟滞规则得到 `GOOD` / `BAD`，`BAD` 时 `badStreak + 1`，`GOOD` 时清零。
-- 确认：`badStreak >= K`（默认 2）即确认前倾。
-- 冷却：确认后若距上次通知不足 `cooldown`（默认 10 min），只记录事件不通知。
-- 快照：窗内角度最接近中位数的那一帧作为代表帧，画上耳肩髋连线和角度后存 JPEG。
+v0.2 的定时采样窗（每 45±15 s 开相机 3 s）在两次采样之间存在监控盲区，实测也只有 7-10 fps。v0.3 改为相机常开的双速检测：
+
+- **巡检（SLOW）**：默认每 700 ms 分析一帧（约 1.4 fps），只做逐帧比较，不进窗聚合。连续 `triggerFrames`（默认 2）个有效帧超过阈值就进入确认。
+- **确认（FAST）**：默认每 125 ms 一帧（约 8 fps），开一个 `confirmWindowMillis`（默认 3 s）的窗，窗聚合、中位数、迟滞、连续窗计数与冷却全部复用 4.4 的 `PostureAnalyzer`，语义与 v0.2 完全一致。窗判为 BAD 但未连够 K 个窗时背靠背再开一窗；判为 GOOD 立刻回巡检；连续 `maxInvalidWindows`（默认 2）个无效窗也回巡检，避免无人时空跑高帧率。
+- **前倾中（S2）**：确认后回到巡检帧率但保持前倾状态，等待恢复。连续 `recoverFrames`（默认 5）个有效帧低于「阈值 - 迟滞」判为恢复，发 RECOVERED 事件；若始终不恢复，且距确认已超过 `retriggerHoldMillis`（默认 30 s）并且通知冷却也已过，则重新进入确认再提醒一次。
+
+恢复时调用 `markRecovered()` 而非 `resetState()`：清掉前倾状态与连续计数，但**保留冷却**，所以刚恢复又前倾不会立刻重复提醒。确认后也不清 `badStreak`，重触发时一个 BAD 窗即可再次确认。
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Waiting: 服务启动
-    Waiting --> Sampling: 等待 interval ± jitter 后绑定相机
-    Sampling --> Evaluate: 窗结束，解绑相机
-    Evaluate --> Waiting: INVALID（有效帧不足，streak 不变）
-    Evaluate --> Waiting: GOOD（streak = 0）
-    Evaluate --> Confirmed: BAD 且 streak >= K
-    Evaluate --> Waiting: BAD 且 streak < K
-    Confirmed --> Notify: 冷却已过
-    Confirmed --> RecordOnly: 冷却期内
-    Notify --> Waiting: 记 ALERT 事件，发通知附截图
-    RecordOnly --> Waiting: 记 CONFIRMED 事件
-    Waiting --> [*]: 用户停止 / 服务被杀
+    [*] --> Patrol: 服务启动，相机常开
+    Patrol --> Confirm: 连续 N 帧 > 阈值
+    Confirm --> Confirm: 窗 BAD 但未满 K，或窗无效未超上限
+    Confirm --> Patrol: 窗 GOOD / 连续无效窗超上限
+    Confirm --> ForwardHead: 连续 K 窗 BAD，确认前倾
+    ForwardHead --> Notify: 冷却已过
+    ForwardHead --> RecordOnly: 冷却期内
+    Notify --> ForwardHead: 记 ALERT，发通知附截图
+    RecordOnly --> ForwardHead: 记 CONFIRMED
+    ForwardHead --> Confirm: 未恢复且超过重触发间隔与冷却
+    ForwardHead --> Patrol: 连续 M 帧 < 阈值-迟滞，记 RECOVERED
+    Patrol --> [*]: 用户停止 / 服务被杀
 ```
 
-所有参数在设置页可调，服务在每个采样窗前重新读取一次，修改即时生效。
+所有参数在设置页可调，服务通过 DataStore 流实时接收变更。
 
 ## 5. Android 运行时设计
 
@@ -122,7 +123,9 @@ stateDiagram-v2
 | 模式 | 持有者 | 用例 | 说明 |
 |------|--------|------|------|
 | 预览模式 | `MainActivity`（摆放/校准页） | Preview + ImageAnalysis | 用户看画面、确认对齐、校准基线 |
-| 监测模式 | `MonitorService` | 仅 ImageAnalysis | 只在采样窗内绑定，窗外解绑，省电且相机指示灯不常亮 |
+| 监测模式 | `MonitorService` | 仅 ImageAnalysis | v0.3 起常驻绑定，靠送帧节流区分巡检与确认；相机指示灯会常亮 |
+
+两处的 use case 由 `camera/CameraUseCases` 统一构建（同样的 4:3 与分辨率策略），避免两边算出的角度出现系统性差异。镜头由 `camera/CameraLensResolver` 解析，超广角依次尝试：独立的更广后摄 -> 逻辑后摄的物理子镜头 -> 变焦下限小于 1 时 `setZoomRatio` -> 退回普通后摄并在界面说明。
 
 两者互斥：点"开始监测"时 Activity 先解绑并停掉推理引擎，再启动服务；服务运行期间摆放页不开预览。
 
@@ -139,8 +142,9 @@ stateDiagram-v2
 | 场景 | 处理 |
 |------|------|
 | 模型加载失败 | `PoseLandmarkerEngine.start()` 返回 false，服务记 ERROR 事件、发错误通知、自停 |
-| 相机被占用 / 绑定失败 | `bindCamera()` 捕获异常，记 ERROR，跳过本窗，下个窗重试 |
-| 采样窗 5 s 内无帧 | 记 ERROR"相机可能被占用"，本窗按 INVALID 处理 |
+| 相机被占用 / 绑定失败 | `bindCameraWithRetry()` 捕获异常，记 CAMERA 事件，交由看门狗退避重试 |
+| 5 s 内无相机帧 | 记 CAMERA 事件，解绑后按指数退避（1 s 起，上限 30 s）重新绑定；确认窗按 INVALID 结算 |
+| GPU 委托不可用 | 创建失败或首帧报错都一次性回退 CPU，记 INFO 并继续运行 |
 | 推理回调异常 | `onError` 上抛，记 ERROR，不影响循环 |
 | 存图失败 | `SnapshotStore.save` 返回 null，事件照记，通知不带图 |
 | 通知权限缺失 | `AlertNotifier.canPost()` 为 false 时丢弃通知并打日志，摆放页提示去授权 |
@@ -150,11 +154,13 @@ stateDiagram-v2
 
 ### 5.4 线程模型
 
-- CameraX 分析线程（单线程 Executor）：`ImageProxy` 转 Bitmap、旋转、送入 MediaPipe，随后立即关闭 `ImageProxy`。
-- MediaPipe 内部串行队列：结果回调，做几何计算、`analyzer.addFrame`、JPEG 编码，最后回收 Bitmap。
-- 调度协程（`Dispatchers.Default`）：等待、`beginWindow` / `endWindow`、写事件、发通知；相机绑定和解绑切到 `Dispatchers.Main`。
-- `PostureAnalyzer` 全部方法 `@Synchronized`；窗内 JPEG 缓存用独立锁；`windowOpen` 用 `AtomicBoolean` 门控回调线程。
-- 节流：`PoseLandmarkerEngine` 按 100 ms 最小间隔提交，且同一时刻只允许一帧在推理，避免堆积。
+- CameraX 分析线程（单线程 Executor）：先判节流，通过了才把 `ImageProxy` 转 Bitmap 并旋转送入 MediaPipe，随后立即关闭 `ImageProxy`。输出格式为 YUV_420_888，被丢弃的帧不触发任何像素转换。
+- MediaPipe 内部串行队列：结果回调只做几何计算、`tracker.onFrame`、投递任务，必须保持轻量。
+- JPEG 编码线程（单线程 Executor）：确认窗内的有效帧在此编码并按 `windowSeq` 分桶缓存，编码完回收 Bitmap；未交出的 Bitmap 由回调线程回收。`pendingEncodes` 上限 8，超限只丢截图不丢角度。
+- 事件消费协程：顺序处理 `TrackerEvent`，写事件日志、存快照、发通知与上报。
+- 看门狗协程（`Dispatchers.Default`，每 250 ms）：驱动确认窗到期，并在 5 s 未收到相机帧时按指数退避重新绑定；相机绑定与解绑切到 `Dispatchers.Main` 并用 `Mutex` 串行。
+- `PostureAnalyzer` 与 `PostureTracker` 全部方法 `@Synchronized`，锁序固定为 tracker -> analyzer；返回的事件列表在锁外处理。
+- 节流：`PoseLandmarkerEngine` 的最小间隔是 `AtomicLong`，随模式切换在巡检 700 ms 与确认 125 ms 之间实时切换，同一时刻只允许一帧在推理。
 
 ## 6. 模块清单
 
@@ -162,8 +168,12 @@ stateDiagram-v2
 |------|------|
 | `pose/PostureGeometry.kt` | 纯函数：选侧、像素坐标还原、颈部与躯干倾角、对齐比、帧结果分类 |
 | `pose/PostureAnalyzer.kt` | 采样窗状态机：窗聚合、中位数、迟滞、连续计数、冷却、校准、代表帧 |
-| `pose/PoseLandmarkerEngine.kt` | MediaPipe LIVE_STREAM 封装：模型加载、帧旋转、节流、结果与错误回调 |
-| `monitor/MonitorService.kt` | camera 类型前台服务：WakeLock、采样调度、按窗绑定/解绑相机、事件处理 |
+| `pose/PoseLandmarkerEngine.kt` | MediaPipe LIVE_STREAM 封装：模型加载、帧旋转、可运行时切换的节流、GPU/CPU 委托、结果与错误回调 |
+| `pose/PostureTracker.kt` | 巡检/确认双速状态机：逐帧触发与恢复判定，窗聚合委托给 `PostureAnalyzer` |
+| `camera/CameraLens.kt` | 镜头与分析分辨率枚举 |
+| `camera/CameraUseCases.kt` | 预览页与服务共用的 ImageAnalysis / Preview 构建器 |
+| `camera/CameraLensResolver.kt` | 超广角四路解析、绑定后变焦、相机诊断 |
+| `monitor/MonitorService.kt` | camera 类型前台服务：WakeLock、相机常驻绑定与断流重连、双速调度、事件消费、截图编码 |
 | `monitor/MonitorBus.kt` | 进程内 `StateFlow` 状态总线，服务写、UI 读 |
 | `monitor/SnapshotStore.kt` | JPEG 编码、叠加连线与角度、落盘、保留最近 300 张 |
 | `monitor/AlertNotifier.kt` | 通知渠道、常驻状态通知、BigPicture 前倾提醒、错误通知 |
@@ -185,7 +195,9 @@ stateDiagram-v2
 ### 7.1 单元测试（CI 每次执行）
 
 - `PostureGeometryTest`：耳在肩正上方 0°、水平 90°、对角 45°、镜像对称；像素坐标而非归一化坐标；左右侧选择；低可见度、无人、未对齐、远肩遮挡、髋缺失。
-- `PostureAnalyzerTest`：中位数奇偶；阈值 clamp；INVALID 窗不动 streak；未对齐帧只计数；K 连续确认；GOOD 清零；冷却压制与恢复；迟滞进出；校准重置状态；代表帧最接近中位数；躯干中位数忽略 null。
+- `PostureAnalyzerTest`：中位数奇偶；阈值 clamp；INVALID 窗不动 streak；未对齐帧只计数；K 连续确认；GOOD 清零；冷却压制与恢复；迟滞进出；校准重置状态；代表帧最接近中位数；躯干中位数忽略 null；`markRecovered` 保留冷却；`canNotify`；退出线。
+- `PostureTrackerTest`：巡检不产生窗帧；连续帧触发并切换节流；触发计数被正常帧与无效帧清零；窗到期（帧驱动与 tick 驱动）；连续无效窗退回巡检；K 窗确认；GOOD 窗打断；恢复判定保留冷却；迟滞带内不动作；重触发受 hold 与冷却双重限制；配置热更新与重置。
+- `CameraLensResolverTest`：视场角公式；前后置直选；超广角四条路径的优先级与各自的命中条件；视场角差距不足时不误选。
 
 ### 7.2 PC 原型
 

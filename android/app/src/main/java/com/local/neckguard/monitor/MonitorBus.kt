@@ -5,21 +5,47 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 
-enum class MonitorPhase { IDLE, STARTING, WAITING, SAMPLING, ERROR }
+enum class MonitorPhase {
+    IDLE,
+    STARTING,
+    /** 相机常开、低帧率巡检。 */
+    PATROL,
+    /** 高帧率确认窗。 */
+    CONFIRMING,
+    /** 超时没有收到相机帧，正在重连。 */
+    CAMERA_LOST,
+    ERROR,
+}
 
 data class MonitorState(
     val running: Boolean = false,
     val phase: MonitorPhase = MonitorPhase.IDLE,
     val startedAtMillis: Long? = null,
-    val nextSampleAtMillis: Long? = null,
-    val lastSampleAtMillis: Long? = null,
+    /** 已确认前倾且尚未恢复。 */
+    val forwardHead: Boolean = false,
+    // 实时帧信息
+    val lastNeckDeg: Float? = null,
+    val lastFrameResult: String? = null,
+    val lastFrameAtMillis: Long? = null,
+    val inferenceMillis: Long = 0L,
+    val framesAnalyzed: Long = 0L,
+    // 确认窗
+    val lastWindowAtMillis: Long? = null,
     val lastSummary: WindowSummary? = null,
     val badStreak: Int = 0,
     val thresholdDeg: Float? = null,
     val baselineDeg: Float? = null,
+    // 统计
     val windowsRun: Int = 0,
     val invalidWindows: Int = 0,
     val alertsSent: Int = 0,
+    val triggers: Int = 0,
+    val recoveries: Int = 0,
+    val cameraRebinds: Int = 0,
+    // 运行环境
+    val lens: String? = null,
+    val delegate: String? = null,
+    val analysisSize: String? = null,
     val lastError: String? = null,
     /** 最近一次通知附带的快照路径，UI 直接显示。 */
     val lastSnapshotPath: String? = null,

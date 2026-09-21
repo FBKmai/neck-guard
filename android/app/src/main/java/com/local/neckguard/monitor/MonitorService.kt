@@ -6,28 +6,29 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.PowerManager
 import android.util.Log
-import android.util.Size
-import android.view.Surface
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.resolutionselector.ResolutionSelector
-import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.camera.core.Camera
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
+import com.local.neckguard.camera.CameraLensResolver
+import com.local.neckguard.camera.CameraUseCases
+import com.local.neckguard.camera.LensResolution
 import com.local.neckguard.data.EventLog
 import com.local.neckguard.data.EventType
 import com.local.neckguard.data.PostureEvent
 import com.local.neckguard.data.Settings
 import com.local.neckguard.data.SettingsRepository
 import com.local.neckguard.pose.FrameResult
+import com.local.neckguard.pose.ModeChangeReason
 import com.local.neckguard.pose.PoseFrame
 import com.local.neckguard.pose.PoseLandmarkerEngine
-import com.local.neckguard.pose.PostureAnalyzer
 import com.local.neckguard.pose.PostureGeometry
 import com.local.neckguard.pose.PostureMeasurement
+import com.local.neckguard.pose.PostureTracker
+import com.local.neckguard.pose.TrackerEvent
+import com.local.neckguard.pose.TrackerMode
 import com.local.neckguard.pose.WindowOutcome
 import com.local.neckguard.pose.WindowVerdict
 import com.local.neckguard.report.CompositeSink
@@ -37,22 +38,30 @@ import com.local.neckguard.report.PcSink
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
-import kotlin.random.Random
 
 /**
- * 前台服务（camera 类型）：按「等待 -> 采样窗 -> 判定」循环工作。
- * 只在采样窗内绑定相机，窗外释放，省电且不常亮相机指示灯。
+ * 前台服务（camera 类型）：相机常开，按「巡检 -> 确认」双速循环工作。
+ *
+ * 巡检期约 1.4 fps，发现疑似前倾后切到约 8 fps 的确认窗，连续 K 个窗判为前倾才提醒。
+ * 相比 v0.2 的定时采样窗，两次采样之间不再有监控盲区。
  */
 class MonitorService : LifecycleService() {
 
@@ -60,24 +69,47 @@ class MonitorService : LifecycleService() {
     private lateinit var eventLog: EventLog
     private lateinit var snapshotStore: SnapshotStore
     private lateinit var notifier: AlertNotifier
-    private lateinit var sink: EventSink
+    private lateinit var tracker: PostureTracker
 
-    private val analyzer = PostureAnalyzer()
+    @Volatile
+    private var sink: EventSink? = null
+
+    @Volatile
+    private var pcSink: PcSink? = null
+
+    @Volatile
     private var engine: PoseLandmarkerEngine? = null
     private var cameraProvider: ProcessCameraProvider? = null
+    private var camera: Camera? = null
+
+    @Volatile
+    private var lensResolution: LensResolution? = null
+
     private val analysisExecutor = Executors.newSingleThreadExecutor()
+
+    /** JPEG 编码专用单线程：FIFO 保证窗结束时此前排队的编码都已落桶。 */
+    private val encodeExecutor = Executors.newSingleThreadExecutor()
+    private val encodeDispatcher = encodeExecutor.asCoroutineDispatcher()
+    private val pendingEncodes = AtomicInteger(0)
+
+    private val eventChannel = Channel<List<TrackerEvent>>(Channel.UNLIMITED)
+    private val cameraMutex = Mutex()
+    private val cameraBound = AtomicBoolean(false)
+    private val lastFrameAt = AtomicLong(0L)
+    private val boundAt = AtomicLong(0L)
+
     private var wakeLock: PowerManager.WakeLock? = null
     private var loopJob: Job? = null
+    private var gpuFallbackDone = false
 
     @Volatile
     private var settings: Settings = Settings()
 
-    // 采样窗内状态：MediaPipe 回调线程写，调度协程读；用 windowOpen 与 windowLock 保护
-    private val windowOpen = AtomicBoolean(false)
-    private val lastFrameAt = AtomicLong(0L)
-    private val windowJpegs = HashMap<Int, ByteArray>()
-    private val windowMeasurements = HashMap<Int, PostureMeasurement>()
+    // 确认窗内的截图缓存。背靠背的相邻窗共用 index 空间，所以必须按 windowSeq 分桶。
+    private val windowJpegs = HashMap<Long, HashMap<Int, ByteArray>>()
+    private val windowMeasurements = HashMap<Long, HashMap<Int, PostureMeasurement>>()
     private val windowLock = Any()
+
     private val deviceId: String by lazy {
         android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID) ?: "android"
     }
@@ -88,6 +120,7 @@ class MonitorService : LifecycleService() {
         eventLog = EventLog(applicationContext)
         snapshotStore = SnapshotStore(applicationContext)
         notifier = AlertNotifier(applicationContext)
+        tracker = PostureTracker()
         sink = CompositeSink(listOf(LocalNotificationSink(notifier)))
     }
 
@@ -96,9 +129,9 @@ class MonitorService : LifecycleService() {
         val sinks = ArrayList<EventSink>()
         sinks.add(LocalNotificationSink(notifier))
         val base = settings.pcBaseUrl
-        if (settings.pcEnabled && base != null) {
-            sinks.add(PcSink(base, settings.pcToken, deviceId))
-        }
+        val pc = if (settings.pcEnabled && base != null) PcSink(base, settings.pcToken, deviceId) else null
+        pc?.let(sinks::add)
+        pcSink = pc
         sink = CompositeSink(sinks)
     }
 
@@ -138,39 +171,44 @@ class MonitorService : LifecycleService() {
         loopJob = lifecycleScope.launch(Dispatchers.Default) {
             try {
                 settings = settingsRepo.current()
-                analyzer.config = settings.toAnalyzerConfig()
-                analyzer.setBaseline(settings.baselineDeg)
+                tracker = PostureTracker(settings.toAnalyzerConfig(), settings.toTrackerConfig())
+                tracker.setBaseline(settings.baselineDeg)
                 rebuildSink()
-                MonitorBus.update { it.copy(thresholdDeg = analyzer.thresholdDeg, baselineDeg = analyzer.baselineDeg) }
 
-                val eng = PoseLandmarkerEngine(applicationContext, ::onPoseFrame, ::onEngineError)
-                if (!eng.start()) {
+                val eng = createEngine(settings.useGpu, tracker.desiredIntervalMillis)
+                if (eng == null) {
                     fail("姿态模型加载失败，已停止监测")
                     return@launch
                 }
                 engine = eng
+
                 cameraProvider = awaitCameraProvider()
+                val resolution = withContext(Dispatchers.Main) {
+                    CameraLensResolver.resolve(cameraProvider!!, settings.cameraLens)
+                }
+                lensResolution = resolution
+
+                MonitorBus.update {
+                    it.copy(
+                        thresholdDeg = tracker.thresholdDeg,
+                        baselineDeg = tracker.baselineDeg,
+                        lens = resolution.description,
+                        delegate = eng.delegateName,
+                        analysisSize = settings.analysisResolution.label,
+                    )
+                }
                 eventLog.append(
-                    PostureEvent(System.currentTimeMillis(), EventType.INFO, message = "监测启动，阈值 ${fmt(analyzer.thresholdDeg)}°"),
+                    PostureEvent(
+                        System.currentTimeMillis(),
+                        EventType.INFO,
+                        message = "监测启动，阈值 ${fmt(tracker.thresholdDeg)}°，镜头 ${resolution.description}，${eng.delegateName}",
+                    ),
                 )
 
-                // 启动后先立刻采一窗，便于用户确认工作正常
-                var waitMillis = 3_000L
-                while (true) {
-                    val nextAt = System.currentTimeMillis() + waitMillis
-                    MonitorBus.update { it.copy(phase = MonitorPhase.WAITING, nextSampleAtMillis = nextAt) }
-                    notifier.updateStatus(statusText())
-                    delay(waitMillis)
-
-                    // 每个窗前重新读一次设置，用户改参数即时生效
-                    settings = settingsRepo.current()
-                    analyzer.config = settings.toAnalyzerConfig()
-                    if (analyzer.baselineDeg != settings.baselineDeg) analyzer.setBaseline(settings.baselineDeg)
-                    rebuildSink()
-
-                    runWindow()
-                    waitMillis = nextInterval()
-                }
+                bindCameraWithRetry()
+                launch { consumeEvents() }
+                launch { collectSettings() }
+                supervise()
             } catch (_: CancellationException) {
                 // 正常停止
             } catch (e: Throwable) {
@@ -178,6 +216,19 @@ class MonitorService : LifecycleService() {
                 fail("监测循环异常: ${e.message}")
             }
         }
+    }
+
+    /** GPU 委托创建失败时立刻回退 CPU；CPU 也失败才算致命。 */
+    private fun createEngine(useGpu: Boolean, intervalMillis: Long): PoseLandmarkerEngine? {
+        if (useGpu) {
+            val gpu = PoseLandmarkerEngine(applicationContext, ::onPoseFrame, ::onEngineError, intervalMillis, useGpu = true)
+            if (gpu.start()) return gpu
+            gpuFallbackDone = true
+            Log.w(TAG, "GPU delegate unavailable, falling back to CPU")
+            lifecycleScope.launch { recordInfo("GPU 加速不可用，已回退 CPU") }
+        }
+        val cpu = PoseLandmarkerEngine(applicationContext, ::onPoseFrame, ::onEngineError, intervalMillis, useGpu = false)
+        return if (cpu.start()) cpu else null
     }
 
     private suspend fun awaitCameraProvider(): ProcessCameraProvider = suspendCancellableCoroutine { cont ->
@@ -194,73 +245,224 @@ class MonitorService : LifecycleService() {
         )
     }
 
-    private fun nextInterval(): Long {
-        val base = settings.intervalSec.coerceAtLeast(5)
-        val jitter = settings.jitterSec.coerceAtLeast(0)
-        val sec = base + if (jitter == 0) 0 else Random.nextInt(-jitter, jitter + 1)
-        return sec.coerceAtLeast(5) * 1000L
-    }
+    /**
+     * 看门狗：驱动确认窗到期，并在相机断流时重新绑定。
+     * 相机常开，任何一次断流都会让检测彻底失效，所以必须主动探活。
+     */
+    private suspend fun supervise() {
+        var backoffMillis = 1_000L
+        var lastStatusAt = 0L
+        while (true) {
+            delay(TICK_MILLIS)
+            val now = System.currentTimeMillis()
 
-    private suspend fun runWindow() {
-        val windowMillis = settings.windowSec.coerceIn(1, 15) * 1000L
-        MonitorBus.update { it.copy(phase = MonitorPhase.SAMPLING) }
-        synchronized(windowLock) {
-            windowJpegs.clear()
-            windowMeasurements.clear()
-        }
-        analyzer.beginWindow()
-        lastFrameAt.set(0L)
-        windowOpen.set(true)
+            // 确认窗内长时间没有帧时，靠 tick 让窗到期（结果为 INVALID）
+            tracker.tick(now).takeIf { it.isNotEmpty() }?.let { eventChannel.send(it) }
 
-        val bound = bindCamera()
-        if (!bound) {
-            windowOpen.set(false)
-            return
-        }
-        try {
-            // 相机启动约需 0.5-1 s，窗计时从第一帧到达开始；最多等 5 s
-            val deadline = System.currentTimeMillis() + 5_000L
-            while (lastFrameAt.get() == 0L && System.currentTimeMillis() < deadline) delay(100L)
-            if (lastFrameAt.get() == 0L) {
-                recordError("采样窗 5 秒内没有收到相机帧（相机可能被占用）")
-            } else {
-                delay(windowMillis)
+            val silentSince = maxOf(lastFrameAt.get(), boundAt.get())
+            if (cameraBound.get() && silentSince > 0L && now - silentSince > NO_FRAME_TIMEOUT_MILLIS) {
+                MonitorBus.update { it.copy(phase = MonitorPhase.CAMERA_LOST, cameraRebinds = it.cameraRebinds + 1) }
+                recordEvent(EventType.CAMERA, "${NO_FRAME_TIMEOUT_MILLIS / 1000} 秒未收到相机帧，重新绑定（退避 ${backoffMillis / 1000} 秒）")
+                unbindCamera()
+                delay(backoffMillis)
+                bindCameraWithRetry()
+                backoffMillis = (backoffMillis * 2).coerceAtMost(MAX_BACKOFF_MILLIS)
+            } else if (lastFrameAt.get() > boundAt.get()) {
+                backoffMillis = 1_000L
             }
-        } finally {
-            windowOpen.set(false)
-            unbindCamera()
-        }
 
-        val now = System.currentTimeMillis()
-        val outcome = analyzer.endWindow(now)
-        handleOutcome(outcome, now)
+            if (now - lastStatusAt > STATUS_REFRESH_MILLIS) {
+                notifier.updateStatus(statusText())
+                lastStatusAt = now
+            }
+        }
     }
 
-    private suspend fun handleOutcome(outcome: WindowOutcome, now: Long) {
+    /**
+     * MediaPipe 回调线程。这里只做轻量工作：几何计算、状态机推进、投递任务。
+     * JPEG 编码与磁盘/网络操作都交给别的线程，否则会直接拖慢推理帧率。
+     */
+    private fun onPoseFrame(frame: PoseFrame) {
+        var bitmapHandedOff = false
+        try {
+            val now = System.currentTimeMillis()
+            lastFrameAt.set(now)
+            val result = PostureGeometry.analyze(
+                frame.landmarks, frame.bitmap.width, frame.bitmap.height, settings.toGeometryConfig(),
+            )
+            val events = tracker.onFrame(result, now)
+
+            // 模式切换后立刻改送帧间隔，巡检与确认的帧率差异全靠它
+            if (events.any { it is TrackerEvent.ModeChanged }) {
+                engine?.setMinIntervalMillis(tracker.desiredIntervalMillis)
+            }
+
+            // 只有进入确认窗的有效帧才值得存图
+            val added = events.firstOrNull { it is TrackerEvent.FrameAdded } as? TrackerEvent.FrameAdded
+            if (added != null && result is FrameResult.Valid && pendingEncodes.get() < MAX_PENDING_ENCODES) {
+                bitmapHandedOff = enqueueEncode(added.windowSeq, added.index, result.measurement, frame)
+            }
+
+            val heavy = events.filter { it !is TrackerEvent.FrameAdded }
+            if (heavy.isNotEmpty()) eventChannel.trySend(heavy)
+
+            val neck = result.measurementOrNull?.neckInclinationDeg
+            MonitorBus.update {
+                it.copy(
+                    phase = phaseOf(),
+                    forwardHead = tracker.inForwardHead,
+                    lastNeckDeg = neck,
+                    lastFrameResult = frameResultText(result),
+                    lastFrameAtMillis = now,
+                    inferenceMillis = frame.inferenceMillis,
+                    framesAnalyzed = it.framesAnalyzed + 1,
+                    badStreak = tracker.badStreak,
+                )
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "process frame failed", e)
+        } finally {
+            if (!bitmapHandedOff) frame.bitmap.recycle()
+        }
+    }
+
+    /** 把这一帧的位图交给编码线程；返回 true 表示所有权已转移，调用方不要再回收。 */
+    private fun enqueueEncode(seq: Long, index: Int, measurement: PostureMeasurement, frame: PoseFrame): Boolean {
+        val bitmap = frame.bitmap
+        pendingEncodes.incrementAndGet()
+        return try {
+            encodeExecutor.execute {
+                try {
+                    val jpeg = snapshotStore.encodeJpeg(bitmap)
+                    synchronized(windowLock) {
+                        val bucket = windowJpegs.getOrPut(seq) { HashMap() }
+                        if (bucket.size < MAX_JPEGS_PER_WINDOW) {
+                            bucket[index] = jpeg
+                            windowMeasurements.getOrPut(seq) { HashMap() }[index] = measurement
+                        }
+                    }
+                } catch (e: Throwable) {
+                    Log.w(TAG, "encode snapshot failed", e)
+                } finally {
+                    bitmap.recycle()
+                    pendingEncodes.decrementAndGet()
+                }
+            }
+            true
+        } catch (e: RejectedExecutionException) {
+            // 服务正在停止，编码线程已关闭：位图仍归调用方
+            pendingEncodes.decrementAndGet()
+            false
+        }
+    }
+
+    /** 单协程顺序消费，保证事件日志与通知的先后关系与状态机一致。 */
+    private suspend fun consumeEvents() {
+        for (batch in eventChannel) {
+            for (event in batch) {
+                try {
+                    handleTrackerEvent(event)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    Log.w(TAG, "handle tracker event failed", e)
+                }
+            }
+        }
+    }
+
+    private suspend fun handleTrackerEvent(event: TrackerEvent) {
+        when (event) {
+            is TrackerEvent.ModeChanged -> onModeChanged(event)
+            is TrackerEvent.WindowEnded -> {
+                // 切到编码线程再取缓存：单线程 FIFO 保证此前排队的编码都已写入桶
+                val cache = withContext(encodeDispatcher) { takeWindowCache(event.windowSeq) }
+                handleOutcome(event.outcome, System.currentTimeMillis(), cache.first, cache.second)
+            }
+            is TrackerEvent.Recovered -> onRecovered(event)
+            is TrackerEvent.FrameAdded -> Unit
+        }
+    }
+
+    private suspend fun onModeChanged(event: TrackerEvent.ModeChanged) {
+        MonitorBus.update {
+            it.copy(
+                phase = phaseOf(),
+                forwardHead = tracker.inForwardHead,
+                triggers = it.triggers + if (event.to == TrackerMode.FAST) 1 else 0,
+            )
+        }
+        when {
+            event.to == TrackerMode.FAST -> {
+                val why = if (event.reason == ModeChangeReason.RETRIGGERED) {
+                    "冷却已过仍未恢复，再次确认"
+                } else {
+                    "连续 ${settings.triggerFrames} 帧超阈值，进入确认"
+                }
+                eventLog.append(
+                    PostureEvent(
+                        timestampMillis = System.currentTimeMillis(),
+                        type = EventType.TRIGGER,
+                        neckDeg = event.neckDeg,
+                        thresholdDeg = tracker.thresholdDeg,
+                        message = why,
+                    ),
+                )
+            }
+            event.reason == ModeChangeReason.TOO_MANY_INVALID ->
+                recordInfo("确认窗连续无效，退回巡检")
+        }
+        notifier.updateStatus(statusText())
+    }
+
+    private suspend fun onRecovered(event: TrackerEvent.Recovered) {
+        MonitorBus.update {
+            it.copy(forwardHead = false, recoveries = it.recoveries + 1, phase = phaseOf(), badStreak = tracker.badStreak)
+        }
+        val seconds = event.forwardHeadMillis / 1000L
+        val posture = PostureEvent(
+            timestampMillis = System.currentTimeMillis(),
+            type = EventType.RECOVERED,
+            neckDeg = event.neckDeg,
+            thresholdDeg = tracker.thresholdDeg,
+            message = if (seconds > 0) "前倾持续 $seconds 秒后恢复" else "已恢复端正坐姿",
+            forwardHeadMillis = event.forwardHeadMillis,
+        )
+        eventLog.append(posture)
+        val target = settings.recoveredNotify
+        if (target.toPhone) notifier.postRecovered(event.neckDeg, event.forwardHeadMillis)
+        if (target.toPc) {
+            try {
+                pcSink?.deliver(posture, null)
+            } catch (e: Exception) {
+                Log.w(TAG, "deliver recovered to pc failed", e)
+            }
+        }
+        notifier.updateStatus(statusText())
+    }
+
+    private suspend fun handleOutcome(
+        outcome: WindowOutcome,
+        now: Long,
+        jpegs: Map<Int, ByteArray>,
+        measurements: Map<Int, PostureMeasurement>,
+    ) {
         val s = outcome.summary
         MonitorBus.update {
             it.copy(
-                lastSampleAtMillis = now,
+                lastWindowAtMillis = now,
                 lastSummary = s,
                 badStreak = outcome.badStreak,
                 thresholdDeg = s.thresholdDeg,
-                baselineDeg = analyzer.baselineDeg,
+                baselineDeg = tracker.baselineDeg,
+                forwardHead = tracker.inForwardHead,
                 windowsRun = it.windowsRun + 1,
                 invalidWindows = it.invalidWindows + if (s.verdict == WindowVerdict.INVALID) 1 else 0,
             )
         }
-        // 取出本窗缓存的帧后立刻清空，避免占内存
-        val jpegs: Map<Int, ByteArray>
-        val measurements: Map<Int, PostureMeasurement>
-        synchronized(windowLock) {
-            jpegs = HashMap(windowJpegs)
-            measurements = HashMap(windowMeasurements)
-            windowJpegs.clear()
-            windowMeasurements.clear()
-        }
         val representativeJpeg = s.representativeFrameIndex?.let { jpegs[it] }
 
-        // 每个采样窗都记一条 WINDOW 事件，供监测页「最近采样」展示；有效窗附代表帧截图
+        // 每个确认窗都记一条 WINDOW 事件，供监测页「最近采样」展示；有效窗附代表帧截图
         val windowSnapshot = if (s.verdict != WindowVerdict.INVALID) {
             representativeJpeg?.let { snapshotStore.save(it, s.representative, s.medianNeckDeg, s.thresholdDeg, now, "win") }
         } else {
@@ -307,88 +509,151 @@ class MonitorService : LifecycleService() {
             if (outcome.shouldNotify) {
                 // 通知与电脑上报都用中位数代表帧，多帧留在 App 内查看
                 val primary = windowSnapshot ?: badFrameFiles.firstOrNull()
-                sink.deliver(event, primary)
+                sink?.deliver(event, primary)
                 MonitorBus.update { it.copy(alertsSent = it.alertsSent + 1, lastSnapshotPath = primary?.absolutePath) }
             }
         }
         notifier.updateStatus(statusText())
     }
 
-    /** MediaPipe 回调线程。 */
-    private fun onPoseFrame(frame: PoseFrame) {
-        try {
-            if (!windowOpen.get()) return
-            lastFrameAt.set(System.currentTimeMillis())
-            val result = PostureGeometry.analyze(
-                frame.landmarks, frame.bitmap.width, frame.bitmap.height, settings.toGeometryConfig(),
-            )
-            val index = analyzer.addFrame(result)
-            if (result is FrameResult.Valid) {
-                val jpeg = snapshotStore.encodeJpeg(frame.bitmap)
-                synchronized(windowLock) {
-                    if (windowJpegs.size < MAX_JPEGS_PER_WINDOW) {
-                        windowJpegs[index] = jpeg
-                        windowMeasurements[index] = result.measurement
+    /** 取走该窗的缓存并顺手清掉更早的桶，避免异常路径下残留。 */
+    private fun takeWindowCache(seq: Long): Pair<Map<Int, ByteArray>, Map<Int, PostureMeasurement>> =
+        synchronized(windowLock) {
+            val jpegs = windowJpegs.remove(seq) ?: emptyMap<Int, ByteArray>()
+            val measurements = windowMeasurements.remove(seq) ?: emptyMap<Int, PostureMeasurement>()
+            windowJpegs.keys.filter { it < seq }.toList().forEach { windowJpegs.remove(it) }
+            windowMeasurements.keys.filter { it < seq }.toList().forEach { windowMeasurements.remove(it) }
+            jpegs to measurements
+        }
+
+    /** 设置变化即时生效：阈值与节奏直接改，镜头/分辨率/委托需要重建。 */
+    private suspend fun collectSettings() {
+        settingsRepo.settings.drop(1).collect { updated ->
+            val old = settings
+            settings = updated
+            tracker.updateConfig(updated.toAnalyzerConfig(), updated.toTrackerConfig())
+            if (tracker.baselineDeg != updated.baselineDeg) tracker.setBaseline(updated.baselineDeg)
+            engine?.setMinIntervalMillis(tracker.desiredIntervalMillis)
+            rebuildSink()
+
+            if (old.useGpu != updated.useGpu) restartEngine(updated.useGpu)
+            if (old.cameraLens != updated.cameraLens || old.analysisResolution != updated.analysisResolution) {
+                val provider = cameraProvider
+                if (provider != null) {
+                    lensResolution = withContext(Dispatchers.Main) {
+                        CameraLensResolver.resolve(provider, updated.cameraLens)
                     }
                 }
+                bindCameraWithRetry()
             }
-        } catch (e: Throwable) {
-            Log.w(TAG, "process frame failed", e)
-        } finally {
-            frame.bitmap.recycle()
+            MonitorBus.update {
+                it.copy(
+                    thresholdDeg = tracker.thresholdDeg,
+                    baselineDeg = tracker.baselineDeg,
+                    lens = lensResolution?.description,
+                    delegate = engine?.delegateName,
+                    analysisSize = updated.analysisResolution.label,
+                )
+            }
         }
+    }
+
+    private suspend fun restartEngine(useGpu: Boolean) {
+        val old = engine
+        engine = null
+        old?.stop()
+        gpuFallbackDone = !useGpu
+        val fresh = createEngine(useGpu, tracker.desiredIntervalMillis)
+        if (fresh == null) {
+            fail("姿态模型重建失败，已停止监测")
+            return
+        }
+        engine = fresh
+        recordInfo("推理委托切换为 ${fresh.delegateName}")
     }
 
     private fun onEngineError(e: Throwable) {
         Log.w(TAG, "engine error", e)
+        val current = engine
+        if (current != null && current.isGpu && !gpuFallbackDone) {
+            // GPU 常常要到第一次推理才报错，这里做一次性回退
+            gpuFallbackDone = true
+            lifecycleScope.launch(Dispatchers.Default) {
+                recordInfo("GPU 推理报错，回退 CPU: ${e.message}")
+                restartEngine(false)
+            }
+            return
+        }
         lifecycleScope.launch { recordError("推理错误: ${e.message}") }
     }
 
-    private suspend fun bindCamera(): Boolean = withContext(Dispatchers.Main) {
-        val provider = cameraProvider ?: return@withContext false
-        val eng = engine ?: return@withContext false
-        try {
-            val selector = if (settings.useFrontCamera) {
-                CameraSelector.DEFAULT_FRONT_CAMERA
-            } else {
-                CameraSelector.DEFAULT_BACK_CAMERA
+    private suspend fun bindCameraWithRetry() {
+        cameraMutex.withLock {
+            withContext(Dispatchers.Main) {
+                val provider = cameraProvider ?: return@withContext
+                val resolution = lensResolution ?: return@withContext
+                try {
+                    val analysis = CameraUseCases.buildAnalysis(settings.analysisResolution, analysisExecutor) { proxy ->
+                        // 引擎重建期间可能为 null，务必关掉帧，否则相机队列会卡死
+                        val current = engine
+                        if (current == null) proxy.close() else current.submit(proxy)
+                    }
+                    provider.unbindAll()
+                    val bound = provider.bindToLifecycle(this@MonitorService, resolution.selector, analysis)
+                    camera = bound
+                    // 变焦路径必须每次绑定后重设，重连相机会回到 1.0x
+                    CameraLensResolver.afterBind(bound, resolution)
+                    cameraBound.set(true)
+                    boundAt.set(System.currentTimeMillis())
+                    lastFrameAt.set(0L)
+                    MonitorBus.update { it.copy(phase = phaseOf()) }
+                } catch (e: Exception) {
+                    Log.e(TAG, "bind camera failed", e)
+                    cameraBound.set(false)
+                    recordEvent(EventType.CAMERA, "相机打开失败: ${e.message}")
+                }
             }
-            val analysis = ImageAnalysis.Builder()
-                .setResolutionSelector(
-                    ResolutionSelector.Builder()
-                        .setResolutionStrategy(
-                            ResolutionStrategy(Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER),
-                        )
-                        .build(),
-                )
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                // 服务里没有窗口，固定按竖屏自然方向旋转，要求手机竖放
-                .setTargetRotation(Surface.ROTATION_0)
-                .build()
-            analysis.setAnalyzer(analysisExecutor) { proxy -> eng.submit(proxy) }
-            provider.unbindAll()
-            provider.bindToLifecycle(this@MonitorService, selector, analysis)
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "bind camera failed", e)
-            recordError("相机打开失败: ${e.message}")
-            false
         }
     }
 
-    private suspend fun unbindCamera() = withContext(Dispatchers.Main) {
-        try {
-            cameraProvider?.unbindAll()
-        } catch (e: Exception) {
-            Log.w(TAG, "unbind camera failed", e)
+    private suspend fun unbindCamera() {
+        cameraMutex.withLock {
+            withContext(Dispatchers.Main) {
+                try {
+                    cameraProvider?.unbindAll()
+                } catch (e: Exception) {
+                    Log.w(TAG, "unbind camera failed", e)
+                }
+                camera = null
+                cameraBound.set(false)
+            }
         }
     }
 
-    private suspend fun recordError(message: String) {
+    private fun phaseOf(): MonitorPhase = when {
+        !cameraBound.get() -> MonitorPhase.CAMERA_LOST
+        tracker.mode == TrackerMode.FAST -> MonitorPhase.CONFIRMING
+        else -> MonitorPhase.PATROL
+    }
+
+    private fun frameResultText(result: FrameResult): String = when (result) {
+        is FrameResult.Valid -> "已对齐"
+        is FrameResult.Misaligned -> "未对齐"
+        FrameResult.LowVisibility -> "看不清耳肩"
+        FrameResult.NoPerson -> "画面中无人"
+    }
+
+    private suspend fun recordError(message: String) = recordEvent(EventType.ERROR, message)
+
+    private suspend fun recordInfo(message: String) {
+        Log.i(TAG, message)
+        eventLog.append(PostureEvent(System.currentTimeMillis(), EventType.INFO, message = message))
+    }
+
+    private suspend fun recordEvent(type: EventType, message: String) {
         Log.w(TAG, message)
         MonitorBus.update { it.copy(lastError = message) }
-        eventLog.append(PostureEvent(System.currentTimeMillis(), EventType.ERROR, message = message))
+        eventLog.append(PostureEvent(System.currentTimeMillis(), type, message = message))
         notifier.updateStatus("异常: $message")
     }
 
@@ -401,14 +666,18 @@ class MonitorService : LifecycleService() {
 
     private fun statusText(): String {
         val st = MonitorBus.state.value
+        val mode = when (st.phase) {
+            MonitorPhase.CONFIRMING -> "确认中"
+            MonitorPhase.CAMERA_LOST -> "相机重连中"
+            else -> if (st.forwardHead) "前倾中" else "巡检中"
+        }
         val last = st.lastSummary
         val lastText = when {
-            last == null -> "尚未采样"
-            last.verdict == WindowVerdict.INVALID -> "上次采样无效(有效帧 ${last.validFrames})"
-            else -> "上次 ${fmt(last.medianNeckDeg)}° / 阈值 ${fmt(last.thresholdDeg)}° " +
-                if (last.verdict == WindowVerdict.BAD) "前倾" else "正常"
+            last == null -> "尚未确认过"
+            last.verdict == WindowVerdict.INVALID -> "上次确认无效(有效帧 ${last.validFrames})"
+            else -> "上次 ${fmt(last.medianNeckDeg)}° / 阈值 ${fmt(last.thresholdDeg)}°"
         }
-        return "$lastText，已采样 ${st.windowsRun} 次，提醒 ${st.alertsSent} 次"
+        return "$mode，$lastText，提醒 ${st.alertsSent} 次"
     }
 
     private fun acquireWakeLock() {
@@ -426,17 +695,24 @@ class MonitorService : LifecycleService() {
     private fun releaseResources() {
         loopJob?.cancel()
         loopJob = null
-        windowOpen.set(false)
+        eventChannel.close()
         try {
             cameraProvider?.unbindAll()
         } catch (_: Exception) {
         }
+        cameraBound.set(false)
+        camera = null
+        // 先停引擎再关编码线程：停掉回调后不会再有新的编码任务被提交
         engine?.stop()
         engine = null
+        synchronized(windowLock) {
+            windowJpegs.clear()
+            windowMeasurements.clear()
+        }
         MonitorBus.update {
             it.copy(
                 running = false,
-                nextSampleAtMillis = null,
+                forwardHead = false,
                 phase = if (it.phase == MonitorPhase.ERROR) it.phase else MonitorPhase.IDLE,
             )
         }
@@ -455,6 +731,7 @@ class MonitorService : LifecycleService() {
         } catch (_: Exception) {
         }
         analysisExecutor.shutdown()
+        encodeExecutor.shutdown()
         super.onDestroy()
     }
 
@@ -463,6 +740,11 @@ class MonitorService : LifecycleService() {
         const val ACTION_START = "com.local.neckguard.action.START"
         const val ACTION_STOP = "com.local.neckguard.action.STOP"
         private const val MAX_JPEGS_PER_WINDOW = 40
+        private const val MAX_PENDING_ENCODES = 8
+        private const val TICK_MILLIS = 250L
+        private const val NO_FRAME_TIMEOUT_MILLIS = 5_000L
+        private const val MAX_BACKOFF_MILLIS = 30_000L
+        private const val STATUS_REFRESH_MILLIS = 5_000L
 
         fun start(context: Context) {
             val intent = Intent(context, MonitorService::class.java).apply { action = ACTION_START }

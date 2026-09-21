@@ -6,6 +6,7 @@
   GET  /api/ping                 -> {"ok": true, "name": "neck-receiver", "version": "1"}
   POST /api/posture/events       multipart/form-data
        字段 event    JSON 文本 {deviceId, ts, type, neckDeg, torsoDeg, thresholdDeg, message}
+                     type 为 ALERT / CONFIRMED / RECOVERED / TEST
        字段 snapshot 可选 image/jpeg
        请求头 X-Neck-Token 可选，与 --token 一致才接受
 """
@@ -274,8 +275,11 @@ def handle_event(cfg: Config, event: dict, snapshot: Optional[bytes]) -> None:
         LOG.info("处于静默时段，只记录不提醒")
         return
 
+    recovered = event_type == "RECOVERED"
     if event_type == "TEST":
         title = "颈椎卫士测试通知"
+    elif recovered:
+        title = "已恢复端正坐姿"
     else:
         title = "检测到头部前倾"
     body = f"颈部倾角 {neck}，阈值 {thr}，{when.strftime('%H:%M:%S')}"
@@ -288,7 +292,9 @@ def handle_event(cfg: Config, event: dict, snapshot: Optional[bytes]) -> None:
             LOG.info("通知已发送（%s）", path_used)
         except Exception as e:
             LOG.error("通知失败: %s", e)
-        play_sound(cfg)
+        # 恢复提示只弹通知不响铃，避免坐正后反而被打扰
+        if not recovered:
+            play_sound(cfg)
 
     threading.Thread(target=worker, name="notify", daemon=True).start()
 
