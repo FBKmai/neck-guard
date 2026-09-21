@@ -269,7 +269,8 @@ class PostureTracker(
             recoverCount++
             if (recoverCount >= config.recoverFrames) {
                 analyzer.markRecovered()
-                events.add(TrackerEvent.Recovered(neck, nowMillis - (confirmedAt ?: nowMillis)))
+                // 只有确认过（用户已经收到提醒）才报恢复，否则"已恢复"会来得莫名其妙
+                confirmedAt?.let { events.add(TrackerEvent.Recovered(neck, nowMillis - it)) }
                 recoverCount = 0
                 confirmedAt = null
             }
@@ -331,10 +332,11 @@ class PostureTracker(
                 consecutiveInvalid = 0
                 events.add(TrackerEvent.WindowEnded(seq, outcome, 0))
                 val median = outcome.summary.medianNeckDeg
-                if (wasForwardHead && median != null) {
-                    events.add(TrackerEvent.Recovered(median, nowMillis - (confirmedAt ?: nowMillis)))
-                    confirmedAt = null
+                val since = confirmedAt
+                if (wasForwardHead && median != null && since != null) {
+                    events.add(TrackerEvent.Recovered(median, nowMillis - since))
                 }
+                confirmedAt = null
                 leaveFast(ModeChangeReason.GOOD_WINDOW, median, events)
             }
             WindowVerdict.BAD -> {
