@@ -2,10 +2,24 @@
 
 用放在身体侧面的手机摄像头，连续检测头部是否明显前倾（"乌龟颈"）。平时低帧率巡检，发现疑似前倾立即切到高帧率确认，确认后在本机弹出通知并附带当时的截图（画有耳肩髋连线和角度），也可同步推送到局域网内的电脑。
 
-- 检测端：Android 手机（前台服务常驻，锁屏后仍能工作）
-- 识别模型：MediaPipe Pose Landmarker（本机推理，图像不上传）
+- 检测端：Android 手机（前台服务常驻，锁屏后仍能工作）；也可以把手机当无线相机，由电脑用更大的模型检测
+- 识别模型：手机上是 MediaPipe Pose Landmarker，电脑上是 YOLO26-pose（都不上传图像）
 - 判定方式：侧视图下耳肩连线与髋肩连线（躯干线）的夹角，即头相对自己身体前伸了多少；支持个人基线校准、迟滞、连续窗确认与冷却
 - 后续阶段：上报服务器并推送到主手机、独立硬件小盒子（见 [docs/DESIGN.md](docs/DESIGN.md)）
+
+## 两种检测方式
+
+设置页的「检测方式」决定画面在哪里被分析：
+
+| | 手机检测（默认） | 电脑检测（无线相机） |
+|---|---|---|
+| 谁推理 | 手机，MediaPipe lite 模型 | 电脑，YOLO26-pose，可选到 x 尺寸 |
+| 手机负担 | 常开相机加推理，较费电 | 只编码推流，轻很多 |
+| 提醒在哪 | 手机通知，可同步到电脑 | 电脑通知 |
+| 适合 | 不在电脑前也想被提醒 | 电脑有独显，想要更高准确率与抗遮挡 |
+| 电脑要开 | `pc/neck_receiver.py`（可选） | `pc/neck_camera_monitor.py`（必须） |
+
+手抬到脸前遮挡时手机端的追踪会抖，电脑端跑大模型加高分辨率明显更稳。
 
 ## 目录结构
 
@@ -24,15 +38,21 @@
 │       ├── data/                 DataStore 设置、JSONL 事件日志
 │       ├── report/               事件出口：本机通知、局域网上报（PcSink）、自动发现（PcDiscovery）
 │       └── ui/                   摆放/校准、监测、设置三个页面
-├── pc/                           电脑接收端（Python），弹 Windows 通知并响铃
-│   ├── neck_receiver.py          HTTP 接收 + UDP 自动发现 + 防火墙放行
-│   ├── run_receiver.bat          双击启动
+├── pc/                           电脑端（Python）
+│   ├── neck_receiver.py          手机检测模式：收事件、弹 Windows 通知、响铃
+│   ├── neck_camera_monitor.py    电脑检测模式：拉手机画面、YOLO 推理、判定与提醒
+│   ├── run_receiver.bat          双击启动接收端
+│   ├── run_camera_monitor.bat    双击启动无线相机模式
+│   ├── requirements-camera.txt   无线相机模式的依赖（torch 另装）
 │   ├── send_test_event.py        本机自测：发一条 TEST 事件
-│   └── test_discovery.py         本机自测：模拟手机端扫描
-└── tools/                        PC 原型（Python），用于调阈值，也是树莓派版本的算法基础
+│   ├── test_discovery.py         本机自测：模拟手机端扫描
+│   └── test_camera_monitor.py    本机自测：假推流端，测拉流与发现协议
+└── tools/                        算法实现与原型，也是树莓派版本的基础
     ├── requirements.txt
-    ├── posture_geometry.py       与 Kotlin 端完全一致的算法实现
-    └── posture_probe.py          命令行工具：批量分析照片 / 实时摄像头
+    ├── posture_geometry.py       与 Kotlin 端完全一致的几何与窗聚合
+    ├── posture_tracker.py        与 Kotlin 端一致的双速状态机
+    ├── posture_probe.py          命令行工具：批量分析照片 / 实时摄像头
+    └── test_geometry.py / test_tracker.py   算法单测，CI 每次执行
 ```
 
 ## 获取 APK
@@ -158,6 +178,17 @@ python posture_probe.py --camera 0
 4. 之后每次前倾提醒都会同时发到电脑。详细参数、发现协议与接口说明见 `pc/README.md`。
 
 之所以用扫描而不是手填：电脑上常有 VMware、WSL、Hyper-V 装的虚拟网卡，`ipconfig` 会列出好几个 IP，手填挑错就会「连接被拒绝」。扫描时地址由电脑按手机所在网段算出，不会填错。
+
+## 无线相机模式（电脑检测）
+
+手机只推画面，电脑用 YOLO26-pose 做检测和提醒。手抬到脸前遮挡时比手机端稳得多。
+
+1. 电脑装依赖：`pip install -r pc/requirements-camera.txt`，再按显卡装 torch（5090 用 cu128，40/30 系用 cu124，详见 `pc/README.md`）。
+2. 手机 App「设置」页把「检测方式」选成「电脑检测」，回「摆放/校准」页点「开始推流」。
+3. 电脑上双击 `pc/run_camera_monitor.bat`，它会自动扫描到手机并开始拉流，弹出预览窗。
+4. 在预览窗里按 `c` 保持端正坐姿 3 秒完成校准，基线会存下来下次自动带上。
+
+排查时先用浏览器打开手机监测页显示的地址（例如 `http://192.168.1.20:8767/`），能看到画面就说明推流正常。完整参数、协议与排查清单见 `pc/README.md`。
 
 ## 监测页的事件记录
 

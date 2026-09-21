@@ -1,7 +1,11 @@
 package com.local.neckguard.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -105,12 +109,16 @@ fun MonitorScreen(eventLog: EventLog, modifier: Modifier = Modifier) {
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         item { StatusCard(monitor, now) }
-        item { LastSampleCard(monitor) }
+        if (monitor.streaming) {
+            item { StreamCard(monitor, context) }
+        } else {
+            item { LastSampleCard(monitor) }
+        }
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (monitor.running) {
                     OutlinedButton(onClick = { MonitorService.stop(context) }, modifier = Modifier.weight(1f)) {
-                        Text("停止监测")
+                        Text(if (monitor.streaming) "停止推流" else "停止监测")
                     }
                 } else {
                     Button(onClick = { MonitorService.start(context) }, modifier = Modifier.weight(1f)) {
@@ -120,48 +128,51 @@ fun MonitorScreen(eventLog: EventLog, modifier: Modifier = Modifier) {
             }
         }
 
-        // 最近采样：横向卡片
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("最近确认窗", style = MaterialTheme.typography.titleMedium)
-                TextButton(onClick = {
-                    scope.launch {
-                        eventLog.clear()
-                        events = emptyList()
-                    }
-                }) { Text("清空事件") }
+        // 推流模式下手机不做判定，没有确认窗与前倾事件可展示，这两段整体跳过
+        if (!monitor.streaming) {
+            // 最近采样：横向卡片
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("最近确认窗", style = MaterialTheme.typography.titleMedium)
+                    TextButton(onClick = {
+                        scope.launch {
+                            eventLog.clear()
+                            events = emptyList()
+                        }
+                    }) { Text("清空事件") }
+                }
             }
-        }
-        item {
-            if (windowEvents.isEmpty()) {
-                Text("暂无确认窗记录", style = MaterialTheme.typography.bodyMedium)
-            } else {
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    itemsIndexed(
-                        windowEvents,
-                        key = { index, it -> "w_" + it.timestampMillis.toString() + "_" + index },
-                    ) { _, event ->
-                        WindowCard(event) { preview = PreviewRequest(event, 0) }
+            item {
+                if (windowEvents.isEmpty()) {
+                    Text("暂无确认窗记录", style = MaterialTheme.typography.bodyMedium)
+                } else {
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        itemsIndexed(
+                            windowEvents,
+                            key = { index, it -> "w_" + it.timestampMillis.toString() + "_" + index },
+                        ) { _, event ->
+                            WindowCard(event) { preview = PreviewRequest(event, 0) }
+                        }
                     }
                 }
             }
-        }
 
-        // 前倾事件：每条带多帧缩略图
-        item { Text("前倾事件", style = MaterialTheme.typography.titleMedium) }
-        if (alertEvents.isEmpty()) {
-            item { Text("暂无前倾事件", style = MaterialTheme.typography.bodyMedium) }
-        } else {
-            itemsIndexed(
-                alertEvents,
-                key = { index, it -> "a_" + it.timestampMillis.toString() + "_" + index },
-            ) { _, event ->
-                AlertEventRow(event) { startIndex -> preview = PreviewRequest(event, startIndex) }
-                HorizontalDivider()
+            // 前倾事件：每条带多帧缩略图
+            item { Text("前倾事件", style = MaterialTheme.typography.titleMedium) }
+            if (alertEvents.isEmpty()) {
+                item { Text("暂无前倾事件", style = MaterialTheme.typography.bodyMedium) }
+            } else {
+                itemsIndexed(
+                    alertEvents,
+                    key = { index, it -> "a_" + it.timestampMillis.toString() + "_" + index },
+                ) { _, event ->
+                    AlertEventRow(event) { startIndex -> preview = PreviewRequest(event, startIndex) }
+                    HorizontalDivider()
+                }
             }
         }
 
@@ -201,8 +212,9 @@ fun MonitorScreen(eventLog: EventLog, modifier: Modifier = Modifier) {
 private fun StatusCard(monitor: MonitorState, now: Long) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            val running = if (monitor.streaming) "推流中" else "监测中"
             Text(
-                text = if (monitor.running) "监测中 · ${phaseText(monitor.phase)}" else "未运行 · ${phaseText(monitor.phase)}",
+                text = if (monitor.running) "$running · ${phaseText(monitor.phase)}" else "未运行 · ${phaseText(monitor.phase)}",
                 style = MaterialTheme.typography.titleMedium,
                 color = if (monitor.phase == MonitorPhase.ERROR) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
             )
@@ -216,29 +228,32 @@ private fun StatusCard(monitor: MonitorState, now: Long) {
                     style = MaterialTheme.typography.titleSmall,
                 )
             }
-            if (monitor.running) {
+            // 推流模式下手机不做判定，角度、阈值与窗计数都没有意义
+            if (!monitor.streaming) {
+                if (monitor.running) {
+                    Text(
+                        buildString {
+                            append("当前 ").append(fmtDeg(monitor.lastNeckDeg))
+                            monitor.lastFrameResult?.let { append("  ").append(it) }
+                            if (monitor.inferenceMillis > 0) append("  ").append(monitor.inferenceMillis).append(" ms")
+                            append("  已分析 ").append(monitor.framesAnalyzed).append(" 帧")
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
                 Text(
                     buildString {
-                        append("当前 ").append(fmtDeg(monitor.lastNeckDeg))
-                        monitor.lastFrameResult?.let { append("  ").append(it) }
-                        if (monitor.inferenceMillis > 0) append("  ").append(monitor.inferenceMillis).append(" ms")
-                        append("  已分析 ").append(monitor.framesAnalyzed).append(" 帧")
+                        append("阈值 ")
+                        append(fmtDeg(monitor.thresholdDeg))
+                        append("    基线 ")
+                        append(monitor.baselineDeg?.let { fmtDeg(it) } ?: "未校准")
                     },
-                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    "确认窗 ${monitor.windowsRun} 次，无效 ${monitor.invalidWindows} 次，触发 ${monitor.triggers} 次，" +
+                        "恢复 ${monitor.recoveries} 次，提醒 ${monitor.alertsSent} 次，连续前倾 ${monitor.badStreak} 窗",
                 )
             }
-            Text(
-                buildString {
-                    append("阈值 ")
-                    append(fmtDeg(monitor.thresholdDeg))
-                    append("    基线 ")
-                    append(monitor.baselineDeg?.let { fmtDeg(it) } ?: "未校准")
-                },
-            )
-            Text(
-                "确认窗 ${monitor.windowsRun} 次，无效 ${monitor.invalidWindows} 次，触发 ${monitor.triggers} 次，" +
-                    "恢复 ${monitor.recoveries} 次，提醒 ${monitor.alertsSent} 次，连续前倾 ${monitor.badStreak} 窗",
-            )
             if (monitor.lens != null || monitor.delegate != null) {
                 Text(
                     buildString {
@@ -253,6 +268,56 @@ private fun StatusCard(monitor: MonitorState, now: Long) {
             }
             monitor.lastError?.let {
                 Text("最近异常：$it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+}
+
+/** 无线相机模式的状态卡：推流地址、客户端数、实际帧率。 */
+@Composable
+private fun StreamCard(monitor: MonitorState, context: Context) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("无线相机", style = MaterialTheme.typography.titleSmall)
+            Text(
+                if (monitor.streamClients > 0) {
+                    "已有 ${monitor.streamClients} 台电脑在拉流"
+                } else {
+                    "等待电脑连接。在电脑上运行 pc/neck_camera_monitor.py 即可自动找到这台手机"
+                },
+                color = if (monitor.streamClients > 0) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            monitor.streamUrl?.let { url ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(url, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                    TextButton(onClick = {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                        clipboard?.setPrimaryClip(ClipData.newPlainText("NeckGuard 推流地址", url))
+                        Toast.makeText(context, "已复制推流地址", Toast.LENGTH_SHORT).show()
+                    }) { Text("复制") }
+                }
+            }
+            Text(
+                String.format(
+                    Locale.US,
+                    "%.1f fps    已推 %d 帧    %.1f MB",
+                    monitor.streamFps,
+                    monitor.streamFramesSent,
+                    monitor.streamBytesSent / 1024f / 1024f,
+                ),
+                style = MaterialTheme.typography.bodySmall,
+            )
+            if (!monitor.streamDiscoveryOn) {
+                Text(
+                    "自动发现未启用（UDP 端口被占用），电脑端请用 --url 手填上面的地址",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
             }
         }
     }
@@ -488,6 +553,7 @@ private fun phaseText(phase: MonitorPhase): String = when (phase) {
     MonitorPhase.PATROL -> "巡检中"
     MonitorPhase.CONFIRMING -> "确认中"
     MonitorPhase.CAMERA_LOST -> "相机丢失，重连中"
+    MonitorPhase.STREAMING -> "画面推送中"
     MonitorPhase.ERROR -> "异常"
 }
 

@@ -43,6 +43,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import com.local.neckguard.camera.AnalysisResolution
 import com.local.neckguard.camera.CameraLens
 import com.local.neckguard.camera.CameraLensResolver
+import com.local.neckguard.data.DetectionMode
 import com.local.neckguard.data.EventLog
 import com.local.neckguard.data.EventType
 import com.local.neckguard.data.PostureEvent
@@ -89,9 +90,85 @@ fun SettingsScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        Text("检测方式", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "「手机检测」是手机本机推理并提醒；「电脑检测」下手机只当无线相机把画面推给电脑，" +
+                "由电脑用更大的模型判定并弹通知，手机侧不提醒也不存事件。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        ChoiceRow(
+            label = "在哪里检测",
+            hint = "切换后需要重新点「开始」才生效",
+            options = DetectionMode.entries,
+            selected = settings.detectionMode,
+            optionLabel = { it.label },
+            onSelect = { v -> save { it.copy(detectionMode = v) } },
+        )
+
+        if (settings.detectionMode == DetectionMode.PC_STREAM) {
+            HorizontalDivider()
+            Text("无线相机（推流给电脑）", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "在电脑上运行 pc/neck_camera_monitor.py，它会自动扫描到这台手机并开始拉流。" +
+                    "也可以用浏览器打开手机的推流地址先确认画面。改端口或密钥后要重新开始推流才生效。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            IntField(
+                label = "推流端口",
+                hint = "电脑访问 http://手机IP:端口/video，默认 8767",
+                value = settings.streamPort,
+                validate = { it in 1024..65535 },
+                onSave = { v -> save { it.copy(streamPort = v) } },
+                onInvalid = { message = it },
+            )
+            IntField(
+                label = "推流帧率",
+                hint = "每秒推多少帧，默认 10。电脑性能够就可以开高，但会更费手机电量和带宽",
+                value = settings.streamFps,
+                validate = { it in 1..30 },
+                onSave = { v -> save { it.copy(streamFps = v) } },
+                onInvalid = { message = it },
+            )
+            ChoiceRow(
+                label = "推流分辨率",
+                hint = "电脑端检测用的画面尺寸，越大越准也越占带宽",
+                options = AnalysisResolution.entries,
+                selected = settings.streamResolution,
+                optionLabel = { it.label },
+                onSelect = { v -> save { it.copy(streamResolution = v) } },
+            )
+            IntField(
+                label = "JPEG 质量",
+                hint = "30 到 95，默认 70。越高越清晰，占带宽也越多",
+                value = settings.streamJpegQuality,
+                validate = { it in 30..95 },
+                onSave = { v -> save { it.copy(streamJpegQuality = v) } },
+                onInvalid = { message = it },
+            )
+            TextField(
+                label = "推流密钥",
+                hint = "留空则同一 Wi-Fi 下任何设备都能看到画面；填了电脑端要用同样的 --token",
+                stored = settings.streamToken,
+                keyboardType = KeyboardType.Text,
+                onSave = { v -> save { it.copy(streamToken = v.trim()) } },
+            )
+            IntField(
+                label = "自动发现端口（UDP）",
+                hint = "电脑扫描手机用，默认 8768，与电脑端 --discovery-port 一致",
+                value = settings.streamDiscoveryPort,
+                validate = { it in 1024..65535 },
+                onSave = { v -> save { it.copy(streamDiscoveryPort = v) } },
+                onInvalid = { message = it },
+            )
+        }
+
+        HorizontalDivider()
         Text("连续检测", style = MaterialTheme.typography.titleMedium)
         Text(
-            "相机常开：平时低帧率巡检，发现疑似前倾立即切到高帧率确认，连续多个确认窗判为前倾才提醒。",
+            "相机常开：平时低帧率巡检，发现疑似前倾立即切到高帧率确认，连续多个确认窗判为前倾才提醒。" +
+                if (settings.detectionMode == DetectionMode.PC_STREAM) "（电脑检测模式下这组参数由电脑端命令行控制）" else "",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

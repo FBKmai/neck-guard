@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.PowerManager
 import android.util.Log
 import androidx.camera.core.Camera
+import androidx.camera.core.ImageProxy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -15,6 +16,7 @@ import androidx.lifecycle.lifecycleScope
 import com.local.neckguard.camera.CameraLensResolver
 import com.local.neckguard.camera.CameraUseCases
 import com.local.neckguard.camera.LensResolution
+import com.local.neckguard.data.DetectionMode
 import com.local.neckguard.data.EventLog
 import com.local.neckguard.data.EventType
 import com.local.neckguard.data.PostureEvent
@@ -31,11 +33,14 @@ import com.local.neckguard.pose.TrackerEvent
 import com.local.neckguard.pose.TrackerMode
 import com.local.neckguard.pose.WindowOutcome
 import com.local.neckguard.pose.WindowVerdict
+import com.local.neckguard.report.CameraDiscoveryResponder
 import com.local.neckguard.report.CompositeSink
 import com.local.neckguard.report.EventSink
 import com.local.neckguard.report.LocalNotificationSink
+import com.local.neckguard.report.MjpegServer
 import com.local.neckguard.report.PcSink
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
@@ -48,6 +53,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
@@ -102,6 +109,21 @@ class MonitorService : LifecycleService() {
     private var loopJob: Job? = null
     private var gpuFallbackDone = false
 
+    // ---- 无线相机模式 ----
+    /** 本次运行是推流而非本机检测。startMonitoring 之后不再变。 */
+    @Volatile
+    private var streaming = false
+
+    @Volatile
+    private var mjpegServer: MjpegServer? = null
+
+    @Volatile
+    private var discoveryResponder: CameraDiscoveryResponder? = null
+
+    /** 推流节流：上一帧送出的时刻。只在相机分析线程读写。 */
+    private var lastStreamFrameAt = 0L
+    private val streamFramesSent = AtomicLong(0L)
+
     @Volatile
     private var settings: Settings = Settings()
 
@@ -143,13 +165,15 @@ class MonitorService : LifecycleService() {
                 START_NOT_STICKY
             }
             else -> {
-                if (loopJob?.isActive != true) startMonitoring()
+                // 被系统重建（START_STICKY）时 intent 为 null，按设置里的模式恢复
+                val forceStream = intent?.action == ACTION_START_STREAM
+                if (loopJob?.isActive != true) startMonitoring(forceStream)
                 START_STICKY
             }
         }
     }
 
-    private fun startMonitoring() {
+    private fun startMonitoring(forceStream: Boolean = false) {
         val notification = notifier.buildStatusNotification("正在启动")
         try {
             val type = if (Build.VERSION.SDK_INT >= 30) ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA else 0
@@ -171,6 +195,11 @@ class MonitorService : LifecycleService() {
         loopJob = lifecycleScope.launch(Dispatchers.Default) {
             try {
                 settings = settingsRepo.current()
+                streaming = forceStream || settings.detectionMode == DetectionMode.PC_STREAM
+                if (streaming) {
+                    startStreaming()
+                    return@launch
+                }
                 tracker = PostureTracker(settings.toAnalyzerConfig(), settings.toTrackerConfig())
                 tracker.setBaseline(settings.baselineDeg)
                 rebuildSink()
@@ -215,6 +244,171 @@ class MonitorService : LifecycleService() {
                 Log.e(TAG, "monitor loop crashed", e)
                 fail("监测循环异常: ${e.message}")
             }
+        }
+    }
+
+    /**
+     * 无线相机模式：不加载姿态模型，相机帧直接编码成 JPEG 推给电脑。
+     * 相机绑定、断流重连、WakeLock、常驻通知全部复用本机检测那一套。
+     *
+     * 声明成 CoroutineScope 的扩展，是为了让里面的 launch 挂在 loopJob 下，
+     * 停止监测时能跟着一起取消。
+     */
+    private suspend fun CoroutineScope.startStreaming() {
+        val server = MjpegServer(
+            port = settings.streamPort,
+            token = settings.streamToken,
+            deviceName = Build.MODEL ?: "Android",
+            lensDescription = { lensResolution?.description },
+            targetFps = { settings.streamFps },
+        )
+        if (!server.start()) {
+            fail("推流端口 ${settings.streamPort} 占用失败：${server.lastError ?: "未知原因"}，请换一个端口")
+            return
+        }
+        mjpegServer = server
+
+        val responder = CameraDiscoveryResponder(
+            discoveryPort = settings.streamDiscoveryPort,
+            streamPort = { settings.streamPort },
+            tokenRequired = { settings.streamToken.isNotBlank() },
+            deviceName = Build.MODEL ?: "Android",
+        )
+        // 发现服务绑不上不致命：电脑端手填地址一样能用
+        val discoveryOk = responder.start()
+        discoveryResponder = responder
+
+        cameraProvider = awaitCameraProvider()
+        val resolution = withContext(Dispatchers.Main) {
+            CameraLensResolver.resolve(cameraProvider!!, settings.cameraLens)
+        }
+        lensResolution = resolution
+
+        val url = "http://${localIpv4() ?: "手机IP"}:${settings.streamPort}/video"
+        MonitorBus.update {
+            it.copy(
+                phase = MonitorPhase.STREAMING,
+                streaming = true,
+                streamUrl = url,
+                streamDiscoveryOn = discoveryOk,
+                lens = resolution.description,
+                analysisSize = settings.streamResolution.label,
+                delegate = "不推理（电脑检测）",
+            )
+        }
+        eventLog.append(
+            PostureEvent(
+                System.currentTimeMillis(),
+                EventType.INFO,
+                message = "无线相机启动，$url，${settings.streamResolution.label} @ ${settings.streamFps} fps，" +
+                    "镜头 ${resolution.description}" + if (discoveryOk) "，自动发现已开" else "，自动发现未启用",
+            ),
+        )
+
+        bindCameraWithRetry()
+        launch { collectSettings() }
+        superviseStream()
+    }
+
+    /** 推流模式的看门狗：断流重连 + 刷新常驻通知，不需要驱动确认窗。 */
+    private suspend fun superviseStream() {
+        var backoffMillis = 1_000L
+        var lastStatusAt = 0L
+        var lastFpsAt = System.currentTimeMillis()
+        var lastFpsFrames = 0L
+        while (true) {
+            delay(TICK_MILLIS)
+            val now = System.currentTimeMillis()
+
+            val silentSince = maxOf(lastFrameAt.get(), boundAt.get())
+            if (cameraBound.get() && silentSince > 0L && now - silentSince > NO_FRAME_TIMEOUT_MILLIS) {
+                MonitorBus.update { it.copy(phase = MonitorPhase.CAMERA_LOST, cameraRebinds = it.cameraRebinds + 1) }
+                recordEvent(EventType.CAMERA, "${NO_FRAME_TIMEOUT_MILLIS / 1000} 秒未收到相机帧，重新绑定（退避 ${backoffMillis / 1000} 秒）")
+                unbindCamera()
+                delay(backoffMillis)
+                bindCameraWithRetry()
+                backoffMillis = (backoffMillis * 2).coerceAtMost(MAX_BACKOFF_MILLIS)
+            } else if (lastFrameAt.get() > boundAt.get()) {
+                backoffMillis = 1_000L
+            }
+
+            if (now - lastStatusAt > STATUS_REFRESH_MILLIS) {
+                val server = mjpegServer
+                val frames = streamFramesSent.get()
+                val elapsed = (now - lastFpsAt).coerceAtLeast(1L)
+                val fps = (frames - lastFpsFrames) * 1000f / elapsed
+                lastFpsAt = now
+                lastFpsFrames = frames
+                MonitorBus.update {
+                    it.copy(
+                        phase = if (cameraBound.get()) MonitorPhase.STREAMING else MonitorPhase.CAMERA_LOST,
+                        streamClients = server?.clientCount ?: 0,
+                        streamFps = fps,
+                        streamFramesSent = frames,
+                        streamBytesSent = server?.totalBytesSent ?: 0L,
+                    )
+                }
+                notifier.updateStatus(streamStatusText(fps))
+                lastStatusAt = now
+            }
+        }
+    }
+
+    private fun streamStatusText(fps: Float): String {
+        val st = MonitorBus.state.value
+        val where = if (cameraBound.get()) "推流中" else "相机重连中"
+        val clients = st.streamClients
+        val target = if (clients > 0) "电脑 $clients 台" else "等待电脑连接"
+        return "$where，$target，${String.format(Locale.US, "%.1f", fps)} fps，${st.streamUrl ?: ""}"
+    }
+
+    /**
+     * 本机在局域网里的 IPv4，用于把推流地址显示给用户。
+     * 手机上可能同时有 Wi-Fi、数据网络和热点地址，这里优先取私网段的那个。
+     * 拿不到返回 null，界面上退化成占位文字，用户仍可靠自动发现连上。
+     */
+    private fun localIpv4(): String? = try {
+        val candidates = NetworkInterface.getNetworkInterfaces()
+            ?.toList()
+            .orEmpty()
+            .filter { it.isUp && !it.isLoopback }
+            .flatMap { it.inetAddresses.toList() }
+            .filterIsInstance<Inet4Address>()
+            .mapNotNull { it.hostAddress }
+            .filter { it.isNotBlank() && !it.startsWith("127.") }
+        candidates.firstOrNull { it.startsWith("192.168.") || it.startsWith("10.") || it.startsWith("172.") }
+            ?: candidates.firstOrNull()
+    } catch (e: Exception) {
+        Log.d(TAG, "list local ip failed: ${e.message}")
+        null
+    }
+
+    /**
+     * 推流模式的帧处理：按目标帧率丢帧，通过的帧才转 Bitmap 与编码。
+     * 跑在相机分析线程，必须自己关掉 ImageProxy。
+     */
+    private fun streamFrame(proxy: ImageProxy) {
+        try {
+            val now = System.currentTimeMillis()
+            val minInterval = (1000L / settings.streamFps.coerceIn(1, 60)).coerceAtLeast(16L)
+            // 节流放在像素转换之前，被丢的帧不做任何解码工作
+            if (now - lastStreamFrameAt < minInterval) return
+            lastStreamFrameAt = now
+            val server = mjpegServer ?: return
+
+            val bitmap = PoseLandmarkerEngine.toUprightBitmap(proxy)
+            try {
+                val jpeg = snapshotStore.encodeJpeg(bitmap, settings.streamJpegQuality.coerceIn(30, 95))
+                server.publish(jpeg, bitmap.width, bitmap.height)
+                streamFramesSent.incrementAndGet()
+                lastFrameAt.set(now)
+            } finally {
+                bitmap.recycle()
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "stream frame failed", e)
+        } finally {
+            proxy.close()
         }
     }
 
@@ -542,6 +736,10 @@ class MonitorService : LifecycleService() {
         settingsRepo.settings.drop(1).collect { updated ->
             val old = settings
             settings = updated
+            if (streaming) {
+                collectStreamSettings(old, updated)
+                return@collect
+            }
             tracker.updateConfig(updated.toAnalyzerConfig(), updated.toTrackerConfig())
             if (tracker.baselineDeg != updated.baselineDeg) tracker.setBaseline(updated.baselineDeg)
             engine?.setMinIntervalMillis(tracker.desiredIntervalMillis)
@@ -566,6 +764,36 @@ class MonitorService : LifecycleService() {
                     analysisSize = updated.analysisResolution.label,
                 )
             }
+        }
+    }
+
+    /**
+     * 推流模式下的设置热更新。
+     * 帧率与 JPEG 质量下一帧就生效；镜头与分辨率要重绑相机；
+     * 端口、密钥和检测模式改了必须重启服务才生效，这里只提示用户。
+     */
+    private suspend fun collectStreamSettings(old: Settings, updated: Settings) {
+        if (old.cameraLens != updated.cameraLens || old.streamResolution != updated.streamResolution) {
+            val provider = cameraProvider
+            if (provider != null) {
+                lensResolution = withContext(Dispatchers.Main) {
+                    CameraLensResolver.resolve(provider, updated.cameraLens)
+                }
+            }
+            bindCameraWithRetry()
+        }
+        val needsRestart = old.streamPort != updated.streamPort ||
+            old.streamToken != updated.streamToken ||
+            old.streamDiscoveryPort != updated.streamDiscoveryPort ||
+            old.detectionMode != updated.detectionMode
+        if (needsRestart) {
+            recordInfo("端口、密钥或检测方式已改，停止后重新开始推流才会生效")
+        }
+        MonitorBus.update {
+            it.copy(
+                lens = lensResolution?.description,
+                analysisSize = updated.streamResolution.label,
+            )
         }
     }
 
@@ -604,10 +832,14 @@ class MonitorService : LifecycleService() {
                 val provider = cameraProvider ?: return@withContext
                 val resolution = lensResolution ?: return@withContext
                 try {
-                    val analysis = CameraUseCases.buildAnalysis(settings.analysisResolution, analysisExecutor) { proxy ->
-                        // 引擎重建期间可能为 null，务必关掉帧，否则相机队列会卡死
-                        val current = engine
-                        if (current == null) proxy.close() else current.submit(proxy)
+                    val analysis = CameraUseCases.buildAnalysis(settings.activeResolution, analysisExecutor) { proxy ->
+                        if (streaming) {
+                            streamFrame(proxy)
+                        } else {
+                            // 引擎重建期间可能为 null，务必关掉帧，否则相机队列会卡死
+                            val current = engine
+                            if (current == null) proxy.close() else current.submit(proxy)
+                        }
                     }
                     provider.unbindAll()
                     val bound = provider.bindToLifecycle(this@MonitorService, resolution.selector, analysis)
@@ -617,6 +849,7 @@ class MonitorService : LifecycleService() {
                     cameraBound.set(true)
                     boundAt.set(System.currentTimeMillis())
                     lastFrameAt.set(0L)
+                    lastStreamFrameAt = 0L
                     MonitorBus.update { it.copy(phase = phaseOf()) }
                 } catch (e: Exception) {
                     Log.e(TAG, "bind camera failed", e)
@@ -643,6 +876,7 @@ class MonitorService : LifecycleService() {
 
     private fun phaseOf(): MonitorPhase = when {
         !cameraBound.get() -> MonitorPhase.CAMERA_LOST
+        streaming -> MonitorPhase.STREAMING
         tracker.mode == TrackerMode.FAST -> MonitorPhase.CONFIRMING
         else -> MonitorPhase.PATROL
     }
@@ -717,6 +951,13 @@ class MonitorService : LifecycleService() {
         // 先停引擎再关编码线程：停掉回调后不会再有新的编码任务被提交
         engine?.stop()
         engine = null
+        // 推流相关：先停发现服务再停推流，避免电脑刚发现就连了个正在关的端口
+        discoveryResponder?.stop()
+        discoveryResponder = null
+        mjpegServer?.stop()
+        mjpegServer = null
+        streaming = false
+        streamFramesSent.set(0L)
         synchronized(windowLock) {
             windowJpegs.clear()
             windowMeasurements.clear()
@@ -725,6 +966,9 @@ class MonitorService : LifecycleService() {
             it.copy(
                 running = false,
                 forwardHead = false,
+                streaming = false,
+                streamClients = 0,
+                streamFps = 0f,
                 phase = if (it.phase == MonitorPhase.ERROR) it.phase else MonitorPhase.IDLE,
             )
         }
@@ -750,6 +994,7 @@ class MonitorService : LifecycleService() {
     companion object {
         private const val TAG = "MonitorService"
         const val ACTION_START = "com.local.neckguard.action.START"
+        const val ACTION_START_STREAM = "com.local.neckguard.action.START_STREAM"
         const val ACTION_STOP = "com.local.neckguard.action.STOP"
         private const val MAX_JPEGS_PER_WINDOW = 40
         private const val MAX_PENDING_ENCODES = 8
@@ -760,6 +1005,12 @@ class MonitorService : LifecycleService() {
 
         fun start(context: Context) {
             val intent = Intent(context, MonitorService::class.java).apply { action = ACTION_START }
+            context.startForegroundService(intent)
+        }
+
+        /** 无线相机模式：只推流，检测交给电脑。 */
+        fun startStream(context: Context) {
+            val intent = Intent(context, MonitorService::class.java).apply { action = ACTION_START_STREAM }
             context.startForegroundService(intent)
         }
 

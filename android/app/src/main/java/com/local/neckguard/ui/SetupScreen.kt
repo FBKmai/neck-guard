@@ -34,6 +34,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.camera.view.PreviewView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.local.neckguard.data.DetectionMode
 import com.local.neckguard.data.SettingsRepository
 import com.local.neckguard.monitor.MonitorBus
 import com.local.neckguard.monitor.MonitorService
@@ -52,6 +53,7 @@ fun SetupScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     val monitor by MonitorBus.state.collectAsStateWithLifecycle()
+    val settings by settingsRepo.settings.collectAsStateWithLifecycle(initialValue = null)
 
     if (monitor.running) {
         // 服务占用相机时不开预览，避免两边争抢
@@ -59,7 +61,8 @@ fun SetupScreen(
             modifier = modifier.padding(24.dp),
             verticalArrangement = Arrangement.Center,
         ) {
-            Text("监测进行中，预览已关闭以释放相机。", style = MaterialTheme.typography.titleMedium)
+            val what = if (monitor.streaming) "推流" else "监测"
+            Text("${what}进行中，预览已关闭以释放相机。", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(12.dp))
             Text("如需重新摆放或校准，请先在「监测」页停止。")
             Spacer(Modifier.height(24.dp))
@@ -140,15 +143,25 @@ fun SetupScreen(
                 }
             }
 
+            val streamMode = settings?.detectionMode == DetectionMode.PC_STREAM
+            if (streamMode) {
+                Card {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("当前是「电脑检测」模式", style = MaterialTheme.typography.titleSmall)
+                        Text("手机只把画面推给电脑，不在本机做判定，也不会在手机上提醒。")
+                        Text("先在电脑上运行 pc/neck_camera_monitor.py，再点下面的按钮开始推流。")
+                    }
+                }
+            }
             Button(
                 onClick = {
                     controller.stop()
-                    MonitorService.start(context)
+                    if (streamMode) MonitorService.startStream(context) else MonitorService.start(context)
                     onMonitoringStarted()
                 },
                 enabled = live.ready,
                 modifier = Modifier.fillMaxWidth(),
-            ) { Text("开始监测") }
+            ) { Text(if (streamMode) "开始推流" else "开始监测") }
         }
     }
 }

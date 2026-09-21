@@ -2,9 +2,11 @@ name: Build Android APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, pc-camera]
     paths:
       - "android/**"
+      - "tools/**"
+      - "pc/**"
       - ".github/workflows/android-apk.yml"
   workflow_dispatch:
 
@@ -13,6 +15,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 算法与拉流逻辑的单测。纯标准库，不装 torch / mediapipe / opencv，
+  # 所以几秒就跑完，能在 APK 构建之前就挡住算法回归。
+  python-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Geometry and tracker tests
+        working-directory: tools
+        run: python -m unittest discover -s . -p "test_*.py" -v
+
+      - name: Camera monitor tests
+        working-directory: pc
+        run: python -m unittest discover -s . -p "test_camera*.py" -v
+
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 40

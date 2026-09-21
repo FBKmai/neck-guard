@@ -14,6 +14,9 @@ enum class MonitorPhase {
     CONFIRMING,
     /** 超时没有收到相机帧，正在重连。 */
     CAMERA_LOST,
+
+    /** 无线相机模式：只推流，不在手机上做检测。 */
+    STREAMING,
     ERROR,
 }
 
@@ -49,6 +52,19 @@ data class MonitorState(
     val lastError: String? = null,
     /** 最近一次通知附带的快照路径，UI 直接显示。 */
     val lastSnapshotPath: String? = null,
+    // 无线相机模式
+    /** 本次运行是推流而非本机检测。 */
+    val streaming: Boolean = false,
+    /** 电脑端可直接访问的推流地址，例如 http://192.168.1.20:8767/video。 */
+    val streamUrl: String? = null,
+    /** 当前连着的拉流客户端数。 */
+    val streamClients: Int = 0,
+    /** 实际推出去的帧率。 */
+    val streamFps: Float = 0f,
+    val streamFramesSent: Long = 0L,
+    val streamBytesSent: Long = 0L,
+    /** 自动发现是否已开启，关掉时电脑端要手填地址。 */
+    val streamDiscoveryOn: Boolean = false,
 )
 
 /** 服务与 UI 之间的进程内状态总线（同进程，无需 AIDL）。 */

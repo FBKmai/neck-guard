@@ -20,6 +20,20 @@ import kotlinx.coroutines.flow.map
 
 private val Context.settingsStore: DataStore<Preferences> by preferencesDataStore(name = "neckguard_settings")
 
+/** 姿态检测在哪一端做。 */
+enum class DetectionMode(val label: String) {
+    /** 手机本机推理并提醒（默认）。 */
+    PHONE("手机检测"),
+
+    /** 手机只当无线相机推 MJPEG 流，检测与提醒都在电脑上。 */
+    PC_STREAM("电脑检测（手机当相机）"),
+    ;
+
+    companion object {
+        fun parse(name: String?): DetectionMode? = name?.let { n -> entries.firstOrNull { it.name == n } }
+    }
+}
+
 /** 恢复端正后提醒到哪里。 */
 enum class RecoveredNotify(val label: String) {
     NONE("不提醒"),
@@ -75,7 +89,25 @@ data class Settings(
     val pcToken: String = "",
     /** 是否把事件上报到电脑。 */
     val pcEnabled: Boolean = false,
+    // ---- 无线相机模式（手机推流，电脑检测）----
+    val detectionMode: DetectionMode = DetectionMode.PHONE,
+    /** MJPEG 推流监听端口。 */
+    val streamPort: Int = 8767,
+    /** 电脑端自动发现用的 UDP 端口。 */
+    val streamDiscoveryPort: Int = 8768,
+    /** 推流目标帧率，电脑性能够时可以开高。 */
+    val streamFps: Int = 10,
+    /** 推流分辨率，独立于本机检测用的分析分辨率。 */
+    val streamResolution: AnalysisResolution = AnalysisResolution.R960x720,
+    /** 推流 JPEG 质量，越高越清晰也越占带宽。 */
+    val streamJpegQuality: Int = 70,
+    /** 推流共享密钥，非空时电脑端要带 X-Neck-Token。 */
+    val streamToken: String = "",
 ) {
+    /** 推流模式下相机实际使用的分辨率。 */
+    val activeResolution: AnalysisResolution
+        get() = if (detectionMode == DetectionMode.PC_STREAM) streamResolution else analysisResolution
+
     /** 规范化后的电脑端根地址（去掉末尾斜杠、补 http://），未配置返回 null。 */
     val pcBaseUrl: String?
         get() {
@@ -136,6 +168,13 @@ class SettingsRepository(private val context: Context) {
         val PC_ENDPOINT = stringPreferencesKey("pc_endpoint")
         val PC_TOKEN = stringPreferencesKey("pc_token")
         val PC_ENABLED = booleanPreferencesKey("pc_enabled")
+        val DETECTION_MODE = stringPreferencesKey("detection_mode")
+        val STREAM_PORT = intPreferencesKey("stream_port")
+        val STREAM_DISCOVERY_PORT = intPreferencesKey("stream_discovery_port")
+        val STREAM_FPS = intPreferencesKey("stream_fps")
+        val STREAM_RESOLUTION = stringPreferencesKey("stream_resolution")
+        val STREAM_JPEG_QUALITY = intPreferencesKey("stream_jpeg_quality")
+        val STREAM_TOKEN = stringPreferencesKey("stream_token")
 
         /**
          * 颈角定义的版本。缺失或小于 [GEOMETRY_VERSION] 时说明存的是旧口径，
@@ -179,6 +218,13 @@ class SettingsRepository(private val context: Context) {
             p[Keys.PC_ENDPOINT] = new.pcEndpoint
             p[Keys.PC_TOKEN] = new.pcToken
             p[Keys.PC_ENABLED] = new.pcEnabled
+            p[Keys.DETECTION_MODE] = new.detectionMode.name
+            p[Keys.STREAM_PORT] = new.streamPort
+            p[Keys.STREAM_DISCOVERY_PORT] = new.streamDiscoveryPort
+            p[Keys.STREAM_FPS] = new.streamFps
+            p[Keys.STREAM_RESOLUTION] = new.streamResolution.name
+            p[Keys.STREAM_JPEG_QUALITY] = new.streamJpegQuality
+            p[Keys.STREAM_TOKEN] = new.streamToken
             // 写入即表示这批值已是新口径，之后不再走迁移分支
             p[Keys.GEOMETRY_VERSION] = GEOMETRY_VERSION
             val baseline = new.baselineDeg
@@ -226,6 +272,13 @@ class SettingsRepository(private val context: Context) {
             pcEndpoint = p[Keys.PC_ENDPOINT] ?: d.pcEndpoint,
             pcToken = p[Keys.PC_TOKEN] ?: d.pcToken,
             pcEnabled = p[Keys.PC_ENABLED] ?: d.pcEnabled,
+            detectionMode = DetectionMode.parse(p[Keys.DETECTION_MODE]) ?: d.detectionMode,
+            streamPort = p[Keys.STREAM_PORT] ?: d.streamPort,
+            streamDiscoveryPort = p[Keys.STREAM_DISCOVERY_PORT] ?: d.streamDiscoveryPort,
+            streamFps = p[Keys.STREAM_FPS] ?: d.streamFps,
+            streamResolution = AnalysisResolution.parse(p[Keys.STREAM_RESOLUTION]) ?: d.streamResolution,
+            streamJpegQuality = p[Keys.STREAM_JPEG_QUALITY] ?: d.streamJpegQuality,
+            streamToken = p[Keys.STREAM_TOKEN] ?: d.streamToken,
         )
     }
 

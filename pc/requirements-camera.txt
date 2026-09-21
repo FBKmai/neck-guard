@@ -1,0 +1,16 @@
+# 无线相机模式（pc/neck_camera_monitor.py）的依赖。
+# 注意：torch 不在这里，要按显卡单独装，见 pc/README.md 的「无线相机模式」一节。
+#   RTX 50 系（Blackwell，需驱动 >= 570）：
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#   RTX 40/30 系：
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+
+ultralytics>=8.4
+opencv-python>=4.10
+numpy
+
+# 可选：Windows 原生 toast 通知（带截图、可点击）。未安装时自动回退 PowerShell toast。
+winotify>=1.1.0
+
+# 可选：--backend mediapipe 的后备后端。需要 Python 3.11 或 3.12。
+# mediapipe==1.0.1

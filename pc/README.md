@@ -1,4 +1,17 @@
-# 颈椎卫士 Windows 接收端
+# 颈椎卫士 电脑端
+
+电脑端有两个程序，按「谁来做检测」区分：
+
+| 程序 | 谁检测 | 用途 |
+|---|---|---|
+| `neck_receiver.py` | 手机 | 手机本机推理，电脑只负责收事件、弹通知、响铃 |
+| `neck_camera_monitor.py` | 电脑 | 手机只当无线相机推画面，电脑用更大的模型判定并提醒 |
+
+两者不能同时对同一台手机用：手机 App 设置页的「检测方式」决定走哪条路。下面先讲接收端，无线相机模式见本文末尾。
+
+---
+
+# 接收端（手机检测）
 
 手机 App 检测到头部前倾后，通过局域网把事件和截图发到这台电脑；电脑弹出 Windows 通知（带截图）并播放提示音。
 
@@ -136,3 +149,122 @@ python send_test_event.py --token test123 --ping   :: 只测连通性
 - UDP `<discovery-port>` 收 `{"neckguard": "discover"}` 探针，单播回接收端地址
 
 截图按 `YYYYMMDD_HHmmss_<类型>.jpg` 保存在 `snapshots/`，只保留最近 200 张。
+
+---
+
+# 无线相机模式（电脑检测）
+
+手机只把摄像头画面推给电脑，姿态检测、判定和提醒全在电脑上做。适合两种情况：手机性能不够或发热，以及电脑有独显想用更大的模型换更高的准确率。
+
+手机端用的是 lite 模型加 640x480，在手抬到脸前遮挡时追踪会抖；电脑端可以跑 YOLO26 的 l 或 x 尺寸加 960 分辨率，遮挡下稳得多。
+
+## 装依赖
+
+```powershell
+cd pc
+python -m pip install -r requirements-camera.txt
+```
+
+`torch` 要按显卡单独装，版本对不上会报 `no kernel image is available`：
+
+| 显卡 | 驱动要求 | 安装命令 |
+|---|---|---|
+| RTX 50 系（5090 等，Blackwell / sm_120） | >= 570 | `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128` |
+| RTX 40 / 30 系 | >= 528 | `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124` |
+
+装完自检，两行都要是 True 和你的卡名：
+
+```powershell
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+首次运行会从 GitHub 下载模型权重，走代理：
+
+```powershell
+$env:HTTPS_PROXY = "http://127.0.0.1:2080"
+```
+
+没装成 torch 也能用：加 `--backend mediapipe` 走 CPU 后备（需要 Python 3.11 或 3.12），准确率与手机端持平，只是不吃 GPU。
+
+## 用法
+
+手机 App「设置」页把「检测方式」选成「电脑检测」，回「摆放/校准」页点「开始推流」。然后在电脑上：
+
+```powershell
+cd pc
+python neck_camera_monitor.py --show
+```
+
+不带参数就自动扫描局域网里的手机。扫不到时用手机监测页显示的地址手填：
+
+```powershell
+python neck_camera_monitor.py --url http://192.168.1.20:8767/video --show
+```
+
+`--show` 会开一个预览窗，能看到实时的耳肩髋连线和角度，并支持快捷键：
+
+- `c` 校准：保持端正坐姿 3 秒，取中位数做个人基线，存进 `camera_monitor.json` 下次自动带上
+- `r` 清除校准，回到绝对阈值
+- `q` 退出
+
+不加 `--show` 就是纯后台模式，只在控制台打状态行。
+
+## 常用参数
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `--url` | 手机推流地址，不填则自动扫描 | 自动 |
+| `--token` | 推流密钥，与手机端设置页一致 | 空 |
+| `--backend` | `yolo` 或 `mediapipe` | yolo |
+| `--model` | YOLO 权重 | 按显存自动选 |
+| `--imgsz` | 推理分辨率，越大越准也越慢 | 960 |
+| `--half` | 半精度推理，GPU 上更快 | 关 |
+| `--device` | `cuda:0` 或 `cpu` | 自动 |
+| `--threshold` | 未校准时的绝对阈值（度） | 35 |
+| `--window-sec` / `--consecutive-windows` | 确认窗时长与连续窗数 | 3 / 2 |
+| `--cooldown-min` | 两次响铃之间的最小间隔（分钟） | 10 |
+| `--allow-no-hip` | 髋不可见时退回竖直参考继续判定 | 关 |
+| `--quiet-hours 23-7` | 静默时段，只记录不提醒 | 无 |
+| `--mute` / `--beep` | 静音 / 用蜂鸣代替提示音 | 关 |
+
+模型按显存自动选：16 GB 以上用 `yolo26x-pose`，10 GB 以上用 l，7 GB 以上用 m，再小用 s。想固定就用 `--model yolo26l-pose.pt`。
+
+## 推流协议
+
+手机端实现在 `android/.../report/MjpegServer.kt`，纯 JDK ServerSocket，没引第三方库。
+
+- `GET /video` → `multipart/x-mixed-replace; boundary=neckguardframe`，每段一帧 JPEG，带 `Content-Length`
+- `GET /snapshot` → 最新一帧 JPEG
+- `GET /info` → `{"neckguard":"camera","name","width","height","fps","lens","token_required","v":1}`
+- `GET /` → 一页内嵌 `<img>` 的 HTML，**用浏览器打开手机地址能直接看到画面**，排查时先试这个
+- 请求头 `X-Neck-Token`，浏览器里没法加头，所以也支持 `?token=xxx`
+
+自动发现（UDP 8768，方向与接收端相反，这次是电脑广播、手机应答）：
+
+- 电脑广播 → `{"neckguard": "discover-camera", "v": 1}`
+- 手机单播回 → `{"neckguard": "camera", "name": "<机型>", "host": "<同网段IP>", "port": 8767, "token_required": false, "v": 1}`
+
+手机回的 `host` 由它那侧按电脑所在网段算出，避免回成数据网络或热点的地址。
+
+## 排查
+
+**扫不到手机**：按顺序查手机是否点了「开始推流」→ 手机和电脑是否同一个 Wi-Fi → 路由器是否开了 AP 隔离（开了只能手填）→ 电脑防火墙是否放行 UDP 8768 的回包。
+
+**扫到了但连不上**：先用浏览器打开 `http://手机IP:8767/`，能看到画面说明推流正常，问题在本脚本这侧。
+
+**注意代理**：如果设了 `HTTP_PROXY` / `HTTPS_PROXY`（本仓库访问 GitHub 就要走代理），默认的 urllib 会把局域网地址也扔给代理，表现为 502。脚本内部已强制直连，不受环境变量影响。
+
+**画面卡顿或延迟大**：降低手机端的推流分辨率或帧率，或者调小 `--imgsz`。推流是「只保留最新帧」的，慢了会丢帧而不是堆积延迟。
+
+**报 `no kernel image is available`**：torch 版本与显卡对不上，按上面的表重装。
+
+## 本机自测
+
+不需要手机也能验证拉流与解析：
+
+```powershell
+cd pc
+python -m unittest test_camera_monitor -v
+```
+
+它会起一个假的推流服务端，覆盖分帧、密钥校验、断线重连、发现协议解析。

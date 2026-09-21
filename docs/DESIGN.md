@@ -9,6 +9,7 @@
 | 阶段 | 检测端 | 通知方式 | 状态 |
 |------|--------|----------|------|
 | v1 | Android 手机 | 本机通知 + 截图 | 本文档主体 |
+| v1.5 | 电脑（手机当无线相机） | 电脑通知 + 截图 | v0.6 起，见第 10 节 |
 | v2 | Android 手机 | 上报服务器，服务器推送到主手机（iOS / Android） | 预留接口 |
 | v3 | 独立硬件小盒子（树莓派 + 摄像头） | 同 v2 | 规划 |
 
@@ -264,3 +265,49 @@ Authorization: Bearer <deviceToken>
 - 采样是间歇式的，1 到 2 fps 足够，Pi 4 跑 lite 模型可满足；Pi Zero 2 W 需实测。
 - 上报走 v2 的同一接口，检测端与手机端互换无感。
 - 更低成本备选：ESP32-S3 摄像头只负责定时拍照上传，推理放在服务器。
+
+## 10. 无线相机模式（v0.6）
+
+手机只推画面，姿态检测、判定与提醒全部移到电脑。动机有两个：手机端的 lite 模型在手抬到脸前遮挡时追踪会抖；而电脑有独显时完全跑得动更大的模型和更高的分辨率。
+
+```
+手机 App（检测方式 = 电脑检测）
+  MonitorService(流模式) ── CameraX ImageAnalysis ── 按目标帧率丢帧
+      → toUprightBitmap → JPEG → MjpegServer(:8767)
+      → CameraDiscoveryResponder(UDP :8768) 应答电脑的探针
+电脑 pc/neck_camera_monitor.py
+  发现手机或 --url → MJPEG 拉流线程（只留最新帧）
+      → YOLO26-pose(GPU) 或 MediaPipe → COCO17 转 33 点
+      → posture_geometry.analyze → posture_tracker.PostureTracker
+      → 复用 neck_receiver 的 toast / 响铃 / 静默时段 / 截图落盘
+```
+
+### 10.1 手机侧
+
+| 模块 | 说明 |
+|------|------|
+| `report/MjpegServer.kt` | 纯 JDK `ServerSocket` 手写 MJPEG，不引第三方 HTTP 库，与 `PcSink` 手写 multipart 的风格一致。路由 `/video`、`/snapshot`、`/info`、`/`（内嵌 img 的 HTML，方便浏览器排查）。最多 4 个客户端，超出回 503 |
+| `report/CameraDiscoveryResponder.kt` | `PcDiscovery` 的反向版：电脑广播 `discover-camera`，手机回自己的推流地址。host 用「connect 到对端后读本地地址」算出同网段 IP，避免回成数据网络或热点地址 |
+| `MonitorService` 流模式 | 复用前台服务、WakeLock、相机绑定、断流重连、常驻通知；跳过模型加载、tracker、事件消费、窗缓存 |
+
+两个关键设计：
+
+- **只保留最新帧**：`publish` 覆盖式写入加 `notifyAll`，慢客户端下一轮直接拿最新帧。天然丢帧，不堆内存也不拖慢相机线程。
+- **节流在像素转换之前**：与 `PoseLandmarkerEngine.submit` 同样的位置判断，被丢的帧不做 YUV 转 Bitmap，否则白白耗电。
+
+### 10.2 电脑侧
+
+`tools/posture_tracker.py` 是 `PostureTracker.kt` 的逐行移植（v0.6 补上，此前 Python 侧只有 `PostureAnalyzer`），19 个单测镜像 Kotlin 的用例。电脑不需要省电，默认把巡检与确认间隔设成一样全速跑，判定语义完全不变。
+
+`pc/neck_camera_monitor.py` 里三处值得记的决定：
+
+1. **不用 `cv2.VideoCapture(url)`**：它内部有缓冲、断线重连不可控。自己按 multipart 边界解析，配合「只留最新帧」把延迟压到最低，断线走指数退避重连（1 s 起，上限 30 s），与 App 侧相机重连同策略。
+2. **强制绕开系统代理**：机器上设了 `HTTP_PROXY` 时，默认的 urllib 会把局域网地址也扔给代理，表现为 502。手机就在同一个 Wi-Fi 里，永远直连。
+3. **COCO 17 点转 33 点**：只填几何用得到的耳、肩、髋，其余 visibility 置 0，`posture_geometry.analyze` 零改动就能复用。conf 直接当 visibility。
+
+模型按显存自动选：16 GB 以上 `yolo26x-pose`，10 GB 以上 l，7 GB 以上 m，再小用 s。torch 装不上时自动回退 MediaPipe 后端。
+
+### 10.3 验证
+
+- `pc/test_camera_monitor.py` 起一个假的 MJPEG 服务端，覆盖分帧（按 `Content-Length` 与按边界两种）、半包保留、密钥校验、断线重连、发现协议解析，不需要手机也不需要 torch。
+- CI 新增 `python-tests` job，跑 `tools/` 与 `pc/` 的全部单测。纯标准库，几秒完成，在 APK 构建之前就能挡住算法回归。
