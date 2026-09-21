@@ -459,7 +459,7 @@ fun SettingsScreen(
                             },
                             modifier = Modifier.fillMaxWidth(),
                         ) {
-                            Column(Modifier.weight(1f)) {
+                            Column(modifier = Modifier.fillMaxWidth()) {
                                 Text(r.name)
                                 Text(
                                     r.baseUrl + if (r.tokenRequired) "（需要密钥）" else "",
