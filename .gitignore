@@ -24,6 +24,9 @@ samples/
 Thumbs.db
 pc/snapshots/
 pc/__pycache__/
+# 无线相机模式的本地状态与自动下载的模型权重
+pc/camera_monitor.json
+*.pt
 
 # 下载回来的构建产物
 *.apk
