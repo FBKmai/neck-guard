@@ -103,7 +103,7 @@ fun SetupScreen(
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("摆放要点", style = MaterialTheme.typography.titleSmall)
                     Text("1. 手机竖放，摄像头在身体正侧面，距离 1 到 1.5 米，高度与肩齐平。")
-                    Text("2. 画面里同时能看到耳朵、肩膀，最好也能看到髋部。")
+                    Text("2. 画面里要同时看到耳朵、肩膀和髋部。前倾角以髋肩连线为基准，看不到髋部就不判定。")
                     Text("3. 上方状态显示「已对齐」后，端正坐好，点「校准」。")
                 }
             }
@@ -161,6 +161,9 @@ private fun StatusBadge(live: LivePreviewController.LiveState, modifier: Modifie
         is FrameResult.LowVisibility -> "耳朵或肩膀不可见" to Color(0xFFFF7043)
         is FrameResult.Misaligned -> String.format(
             Locale.US, "未对齐(肩偏 %.2f) 颈 %.0f°", r.measurement.shoulderOffsetRatio, r.measurement.neckInclinationDeg,
+        ) to Color(0xFFFFA000)
+        is FrameResult.NoTorso -> String.format(
+            Locale.US, "髋部不可见，暂不判定 颈 %.0f°(竖直)", r.measurement.neckInclinationDeg,
         ) to Color(0xFFFFA000)
         is FrameResult.Valid -> {
             val m = r.measurement

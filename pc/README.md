@@ -127,6 +127,8 @@ python send_test_event.py --token test123 --ping   :: 只测连通性
 只有 `ALERT` 和 `TEST` 会响铃。长时间低头时会持续收到「仍在前倾」的静音通知，
 既不漏掉状态，也不会每隔几秒就被铃声打断。响铃间隔由 App 设置页的「提醒冷却」控制，默认 10 分钟。
 
+事件里的 `neckDeg` 是**前倾角**：耳肩连线与髋肩连线（躯干线）的夹角，即头相对自己身体前伸了多少，头与身体共线时为 0°。`torsoDeg` 是躯干与竖直方向的夹角，只做记录不参与判定。App v0.4 及更早发来的 `neckDeg` 是相对竖直线的旧口径，数值会偏大。
+
 - `GET /api/ping` 返回 `{"ok": true, "name": "neck-receiver", "version": "1"}`
 - `POST /api/posture/events`，`multipart/form-data`，字段 `event`（JSON）与可选 `snapshot`（JPEG），请求头 `X-Neck-Token`
 - 返回 200 `{"ok": true}`；密钥不匹配 401；解析失败 400

@@ -7,6 +7,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.util.Log
+import com.local.neckguard.pose.NeckReference
 import com.local.neckguard.pose.PostureMeasurement
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -15,6 +16,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.hypot
 
 /** 快照落盘：在原图上画耳肩髋连线与角度，存 JPEG，只保留最近 MAX_FILES 张。 */
 class SnapshotStore(context: Context) {
@@ -78,18 +80,36 @@ class SnapshotStore(context: Context) {
         if (m != null) {
             m.hip?.let { canvas.drawLine(it.x, it.y, m.shoulder.x, m.shoulder.y, line) }
             canvas.drawLine(m.shoulder.x, m.shoulder.y, m.ear.x, m.ear.y, line)
-            // 竖直参考线
+            // 参考线：颈角以它为基准。有髋就沿躯干延长，否则退回竖直。
             val ref = Paint(line).apply { color = Color.argb(160, 255, 255, 255); strokeWidth = stroke / 2 }
-            canvas.drawLine(m.shoulder.x, m.shoulder.y, m.shoulder.x, m.ear.y - stroke * 4, ref)
+            val neckLen = hypot(m.ear.x - m.shoulder.x, m.ear.y - m.shoulder.y).coerceAtLeast(stroke * 4)
+            val hip = m.hip
+            if (m.neckReference == NeckReference.TORSO && hip != null) {
+                val dx = m.shoulder.x - hip.x
+                val dy = m.shoulder.y - hip.y
+                val len = hypot(dx, dy)
+                if (len < 1e-3f) {
+                    canvas.drawLine(m.shoulder.x, m.shoulder.y, m.shoulder.x, m.shoulder.y - neckLen, ref)
+                } else {
+                    canvas.drawLine(
+                        m.shoulder.x, m.shoulder.y,
+                        m.shoulder.x + dx / len * neckLen * 1.2f, m.shoulder.y + dy / len * neckLen * 1.2f,
+                        ref,
+                    )
+                }
+            } else {
+                canvas.drawLine(m.shoulder.x, m.shoulder.y, m.shoulder.x, m.shoulder.y - neckLen, ref)
+            }
             canvas.drawCircle(m.ear.x, m.ear.y, stroke * 2, dot)
             canvas.drawCircle(m.shoulder.x, m.shoulder.y, stroke * 2, dot)
             m.hip?.let { canvas.drawCircle(it.x, it.y, stroke * 2, dot) }
         }
         val label = buildString {
-            append("颈部 ")
+            append("前倾 ")
             append(neckDeg?.let { String.format(Locale.US, "%.1f", it) } ?: "--")
             append("°")
             thresholdDeg?.let { append("  阈值 ").append(String.format(Locale.US, "%.0f", it)).append("°") }
+            m?.torsoInclinationDeg?.let { append("  躯干 ").append(String.format(Locale.US, "%.0f", it)).append("°") }
         }
         canvas.drawText(label, text.textSize * 0.5f, text.textSize * 1.4f, text)
         canvas.drawText(DISPLAY_TS.format(Date()), text.textSize * 0.5f, text.textSize * 2.8f, text)

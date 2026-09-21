@@ -275,7 +275,7 @@ private fun LastSampleCard(monitor: MonitorState) {
                 WindowVerdict.INVALID -> MaterialTheme.colorScheme.onSurfaceVariant
             }
             Text("判定：${verdictText(s.verdict)}", color = verdictColor, style = MaterialTheme.typography.titleMedium)
-            Text("颈部 ${fmtDeg(s.medianNeckDeg)}    躯干 ${fmtDeg(s.medianTorsoDeg)}    阈值 ${fmtDeg(s.thresholdDeg)}")
+            Text("前倾 ${fmtDeg(s.medianNeckDeg)}    躯干 ${fmtDeg(s.medianTorsoDeg)}    阈值 ${fmtDeg(s.thresholdDeg)}")
             Text(
                 "帧数 ${s.totalFrames}，有效 ${s.validFrames}，未对齐 ${s.misalignedFrames}",
                 style = MaterialTheme.typography.bodySmall,
@@ -333,7 +333,7 @@ private fun AlertEventRow(event: PostureEvent, onOpen: (Int) -> Unit) {
         if (event.neckDeg != null || event.thresholdDeg != null) {
             Text(
                 buildString {
-                    append("颈部 ").append(fmtDeg(event.neckDeg))
+                    append("前倾 ").append(fmtDeg(event.neckDeg))
                     event.torsoDeg?.let { append("  躯干 ").append(fmtDeg(it)) }
                     event.thresholdDeg?.let { append("  阈值 ").append(fmtDeg(it)) }
                 },
@@ -460,7 +460,7 @@ private fun SnapshotPreviewDialog(event: PostureEvent, startIndex: Int, onDismis
                     buildString {
                         append(TIME_FMT.format(Date(event.timestampMillis)))
                         append("  ").append(eventTypeText(event.type))
-                        append("  颈部 ").append(fmtDeg(event.neckDeg))
+                        append("  前倾 ").append(fmtDeg(event.neckDeg))
                         append("  阈值 ").append(fmtDeg(event.thresholdDeg))
                     },
                     color = Color.White,

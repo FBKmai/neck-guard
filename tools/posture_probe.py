@@ -1,16 +1,19 @@
-"""脖子前倾检测 PC 原型：用 MediaPipe Pose Landmarker 跑图片或摄像头，输出颈部倾角与判定。
+"""脖子前倾检测 PC 原型：用 MediaPipe Pose Landmarker 跑图片或摄像头，输出前倾角与判定。
 
 用法：
-  图片/目录批量：  python posture_probe.py --image 照片目录 [--out output] [--threshold 40]
-  摄像头实时：      python posture_probe.py --camera [0] [--threshold 40 --delta 12]
+  图片/目录批量：  python posture_probe.py --image 照片目录 [--out output] [--threshold 35]
+  摄像头实时：      python posture_probe.py --camera [0] [--threshold 35 --delta 12]
                     窗口内按 c 校准（3 秒中位数）、按 r 清除校准、按 q 退出。
 
+前倾角 = 耳肩连线与髋肩连线（躯干线）的夹角，头与身体共线时为 0，躺着不会误报。
+画面里看不到髋部时该帧记为 NO_TORSO 不参与判定，可用 --allow-no-hip 退回竖直参考。
 算法与 Android 端一致，见 posture_geometry.py。
 """
 from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
 import time
@@ -126,8 +129,18 @@ def draw_overlay(bgr: np.ndarray, status: str, m: Optional[pg.Measurement],
             return int(round(p[0])), int(round(p[1]))
 
         ear, sh = ip(m.ear), ip(m.shoulder)
-        # 竖直参考线
-        cv2.line(out, sh, (sh[0], max(0, ear[1] - stroke * 6)), (255, 255, 255), max(1, stroke // 2), cv2.LINE_AA)
+        # 参考线：颈角以它为基准。有躯干线就沿它延长，否则退回竖直。
+        neck_len = max(float(stroke * 6), math.hypot(ear[0] - sh[0], ear[1] - sh[1]))
+        if m.neck_reference == pg.REF_TORSO and m.hip is not None:
+            dx, dy = sh[0] - m.hip[0], sh[1] - m.hip[1]
+            length = math.hypot(dx, dy)
+            if length < 1e-3:
+                ref_end = (sh[0], int(sh[1] - neck_len))
+            else:
+                ref_end = (int(sh[0] + dx / length * neck_len * 1.2), int(sh[1] + dy / length * neck_len * 1.2))
+        else:
+            ref_end = (sh[0], int(sh[1] - neck_len))
+        cv2.line(out, sh, ref_end, (255, 255, 255), max(1, stroke // 2), cv2.LINE_AA)
         if m.hip is not None:
             hip = ip(m.hip)
             cv2.line(out, hip, sh, color, stroke, cv2.LINE_AA)
@@ -135,10 +148,11 @@ def draw_overlay(bgr: np.ndarray, status: str, m: Optional[pg.Measurement],
         cv2.line(out, sh, ear, color, stroke, cv2.LINE_AA)
         cv2.circle(out, ear, stroke * 2, (255, 220, 0), -1, cv2.LINE_AA)
         cv2.circle(out, sh, stroke * 2, (255, 220, 0), -1, cv2.LINE_AA)
-        bad = m.neck_deg > threshold
+        bad = status == pg.VALID and m.neck_deg > threshold
         verdict_color = (0, 0, 230) if bad else (0, 200, 0)
         torso_txt = f"{m.torso_deg:.1f}" if m.torso_deg is not None else "--"
-        lines = [f"{status}  neck {m.neck_deg:.1f} deg  torso {torso_txt}  thr {threshold:.0f}",
+        ref_txt = "torso" if m.neck_reference == pg.REF_TORSO else "vert"
+        lines = [f"{status}  neck {m.neck_deg:.1f} deg ({ref_txt})  torso {torso_txt}  thr {threshold:.0f}",
                  f"side {m.side}  offset {m.shoulder_offset_ratio:.2f}  {'FORWARD' if bad else 'OK'}"]
     else:
         verdict_color = (0, 80, 255)
@@ -195,7 +209,8 @@ def run_images(args) -> int:
         LOG.error("初始化失败：%s", e)
         return 3
 
-    geo_cfg = pg.GeometryConfig(max_shoulder_offset_ratio=args.max_offset)
+    geo_cfg = pg.GeometryConfig(max_shoulder_offset_ratio=args.max_offset,
+                                require_hip=not args.allow_no_hip)
     threshold = args.threshold
     header = f"{'文件':<28} {'状态':<14} {'侧':<5} {'颈角':>7} {'躯干':>7} {'肩偏':>6}  判定"
     print(header)
@@ -217,7 +232,12 @@ def run_images(args) -> int:
                 continue
             status, m = pg.analyze(result_to_landmarks(result), w, h, geo_cfg)
             if m is not None:
-                verdict = "前倾" if m.neck_deg > threshold else "正常"
+                if status == pg.NO_TORSO:
+                    verdict = "无躯干线"
+                elif status == pg.MISALIGNED:
+                    verdict = "未对齐"
+                else:
+                    verdict = "前倾" if m.neck_deg > threshold else "正常"
                 torso = f"{m.torso_deg:7.1f}" if m.torso_deg is not None else f"{'--':>7}"
                 print(f"{path.name[:28]:<28} {status:<14} {m.side:<5} {m.neck_deg:7.1f} {torso} "
                       f"{m.shoulder_offset_ratio:6.2f}  {verdict}")
@@ -257,7 +277,8 @@ def run_camera(args) -> int:
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    geo_cfg = pg.GeometryConfig(max_shoulder_offset_ratio=args.max_offset)
+    geo_cfg = pg.GeometryConfig(max_shoulder_offset_ratio=args.max_offset,
+                                require_hip=not args.allow_no_hip)
     an_cfg = pg.AnalyzerConfig(absolute_threshold_deg=args.threshold, calibration_delta_deg=args.delta)
     analyzer = pg.PostureAnalyzer(an_cfg)
 
@@ -343,10 +364,12 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--image", help="图片文件或目录")
     src.add_argument("--camera", nargs="?", const=0, type=int, help="摄像头索引，默认 0")
     p.add_argument("--out", help="叠加图输出目录，默认 tools/output")
-    p.add_argument("--threshold", type=float, default=40.0, help="未校准时的绝对阈值（度），默认 40")
+    p.add_argument("--threshold", type=float, default=35.0, help="未校准时的绝对阈值（度），默认 35")
     p.add_argument("--delta", type=float, default=12.0, help="校准后阈值 = 基线 + delta，默认 12")
     p.add_argument("--max-offset", type=float, default=0.35, dest="max_offset",
                    help="侧面对齐判定：肩距/躯干长 上限，默认 0.35")
+    p.add_argument("--allow-no-hip", action="store_true", dest="allow_no_hip",
+                   help="髋不可见时退回「与竖直线的夹角」继续判定，默认跳过这些帧")
     p.add_argument("--proxy", help=f"下载模型用的代理，默认 {DEFAULT_PROXY} 或环境变量 HTTPS_PROXY")
     p.add_argument("-v", "--verbose", action="store_true")
     return p

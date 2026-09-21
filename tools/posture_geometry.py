@@ -20,8 +20,13 @@ LANDMARK_COUNT = 33
 # analyze() 返回的状态
 VALID = "VALID"
 MISALIGNED = "MISALIGNED"
+NO_TORSO = "NO_TORSO"
 LOW_VISIBILITY = "LOW_VISIBILITY"
 NO_PERSON = "NO_PERSON"
+
+# 颈角用的参考方向
+REF_TORSO = "TORSO"
+REF_VERTICAL = "VERTICAL"
 
 # end_window() 返回的判定
 GOOD = "GOOD"
@@ -46,16 +51,23 @@ class Measurement:
     ear: Point
     shoulder: Point
     hip: Optional[Point]
+    #: 颈部前倾角：耳肩连线与 neck_reference 指定方向的夹角
     neck_deg: float
+    #: 髋肩连线与竖直向上的夹角，仅用于显示与记录
     torso_deg: Optional[float]
     shoulder_offset_ratio: float
     aligned: bool
+    neck_reference: str = REF_TORSO
 
 
 @dataclass
 class GeometryConfig:
     min_visibility: float = 0.5
     max_shoulder_offset_ratio: float = 0.35
+    #: True（默认）时髋不可见的帧记为 NO_TORSO 不参与判定，False 时退回竖直参考
+    require_hip: bool = True
+    #: 髋肩距离至少要有耳肩距离的多少倍，低于此值认为髋点不可靠
+    min_torso_to_neck_ratio: float = 0.8
 
 
 def median(values: Sequence[float]) -> float:
@@ -75,6 +87,23 @@ def inclination_from_vertical(frm: Point, to: Point) -> float:
     return math.degrees(math.acos(cos))
 
 
+def angle_between(a1: Point, a2: Point, b1: Point, b2: Point) -> float:
+    """向量 a1->a2 与 b1->b2 的夹角，度，范围 0..180。任一向量为 0 时返回 0。"""
+    ax, ay = a2[0] - a1[0], a2[1] - a1[1]
+    bx, by = b2[0] - b1[0], b2[1] - b1[1]
+    la = math.hypot(ax, ay)
+    lb = math.hypot(bx, by)
+    if la < 1e-4 or lb < 1e-4:
+        return 0.0
+    cos = max(-1.0, min(1.0, (ax * bx + ay * by) / (la * lb)))
+    return math.degrees(math.acos(cos))
+
+
+def neck_relative_to_torso(hip: Point, shoulder: Point, ear: Point) -> float:
+    """颈部前倾角：耳肩连线与躯干（hip->shoulder）延长线的夹角。共线时为 0。"""
+    return angle_between(hip, shoulder, shoulder, ear)
+
+
 def distance(a: Point, b: Point) -> float:
     return math.hypot(b[0] - a[0], b[1] - a[1])
 
@@ -88,8 +117,8 @@ def analyze(lms: Optional[Sequence[Landmark]], width: int, height: int,
             cfg: GeometryConfig = GeometryConfig()) -> Tuple[str, Optional[Measurement]]:
     """返回 (status, measurement)。
 
-    status ∈ {VALID, MISALIGNED, LOW_VISIBILITY, NO_PERSON}；
-    仅 VALID / MISALIGNED 时 measurement 非 None。
+    status ∈ {VALID, MISALIGNED, NO_TORSO, LOW_VISIBILITY, NO_PERSON}；
+    仅 VALID / MISALIGNED / NO_TORSO 时 measurement 非 None。
     """
     if lms is None or len(lms) < LANDMARK_COUNT:
         return NO_PERSON, None
@@ -111,13 +140,24 @@ def analyze(lms: Optional[Sequence[Landmark]], width: int, height: int,
 
     ear, shoulder = px(ear_lm), px(sh_lm)
     hip_lm = lms[hip_i]
-    hip: Optional[Point] = px(hip_lm) if hip_lm.visibility >= cfg.min_visibility else None
+    hip_visible: Optional[Point] = px(hip_lm) if hip_lm.visibility >= cfg.min_visibility else None
     far_lm = lms[far_i]
 
-    neck = inclination_from_vertical(shoulder, ear)
-    torso = inclination_from_vertical(hip, shoulder) if hip is not None else None
+    neck_len = distance(ear, shoulder)
+    # 髋点落在肩膀附近时躯干方向是噪声，宁可当成没有躯干线
+    hip: Optional[Point] = hip_visible
+    if hip is not None and distance(shoulder, hip) < neck_len * cfg.min_torso_to_neck_ratio:
+        hip = None
+    torso = inclination_from_vertical(hip_visible, shoulder) if hip_visible is not None else None
 
-    torso_len = distance(shoulder, hip) if hip is not None else distance(ear, shoulder) * 2.0
+    if hip is not None:
+        reference = REF_TORSO
+        neck = neck_relative_to_torso(hip, shoulder, ear)
+    else:
+        reference = REF_VERTICAL
+        neck = inclination_from_vertical(shoulder, ear)
+
+    torso_len = distance(shoulder, hip_visible) if hip_visible is not None else neck_len * 2.0
     if far_lm.visibility < cfg.min_visibility or torso_len < 1e-3:
         # 远侧肩膀被身体挡住，恰好说明是正侧面
         offset = 0.0
@@ -125,15 +165,21 @@ def analyze(lms: Optional[Sequence[Landmark]], width: int, height: int,
         offset = abs(px(far_lm)[0] - shoulder[0]) / max(torso_len, 1e-3)
     aligned = offset < cfg.max_shoulder_offset_ratio
 
-    m = Measurement(side, ear, shoulder, hip, neck, torso, offset, aligned)
-    return (VALID if aligned else MISALIGNED), m
+    m = Measurement(side, ear, shoulder, hip_visible, neck, torso, offset, aligned, reference)
+    # 对齐问题优先提示：摆放不对时算出来的角度本来也不可信
+    if not aligned:
+        return MISALIGNED, m
+    if hip is None and cfg.require_hip:
+        return NO_TORSO, m
+    return VALID, m
 
 
 @dataclass
 class AnalyzerConfig:
-    absolute_threshold_deg: float = 40.0
+    #: v0.5 起颈角相对躯干线，伏案时躯干本身的前倾不再计入，所以比旧的竖直口径低
+    absolute_threshold_deg: float = 35.0
     calibration_delta_deg: float = 12.0
-    threshold_min_deg: float = 30.0
+    threshold_min_deg: float = 20.0
     threshold_max_deg: float = 50.0
     hysteresis_deg: float = 4.0
     min_valid_frames_per_window: int = 8
@@ -159,6 +205,7 @@ class PostureAnalyzer:
         self._valid: List[Tuple[int, Measurement]] = []
         self._total = 0
         self._misaligned = 0
+        self._no_torso = 0
         self._counter = 0
 
     @property
@@ -169,6 +216,7 @@ class PostureAnalyzer:
         self._valid.clear()
         self._total = 0
         self._misaligned = 0
+        self._no_torso = 0
         self._counter = 0
 
     def add_frame(self, status: str, m: Optional[Measurement]) -> int:
@@ -180,11 +228,14 @@ class PostureAnalyzer:
             self._valid.append((idx, m))
         elif status == MISALIGNED:
             self._misaligned += 1
+        elif status == NO_TORSO:
+            self._no_torso += 1
         return idx
 
     def end_window(self, now_ms: int) -> Dict:
         thr = self.threshold
-        base = dict(threshold=thr, total=self._total, valid=len(self._valid), misaligned=self._misaligned)
+        base = dict(threshold=thr, total=self._total, valid=len(self._valid),
+                    misaligned=self._misaligned, no_torso=self._no_torso)
         if len(self._valid) < self.cfg.min_valid_frames_per_window:
             return dict(base, verdict=INVALID, median_neck=None, median_torso=None,
                         representative_index=None, representative=None,

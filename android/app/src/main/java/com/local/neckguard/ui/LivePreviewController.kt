@@ -223,7 +223,10 @@ class LivePreviewController(
         val samples = synchronized(calibrationSamples) { calibrationSamples.toList() }
         if (samples.size < MIN_CALIBRATION_SAMPLES) {
             _state.update {
-                it.copy(calibrating = false, message = "校准失败：有效帧不足（${samples.size}），请确认侧面对齐后重试")
+                it.copy(
+                    calibrating = false,
+                    message = "校准失败：有效帧不足（${samples.size}），请确认已侧面对齐、且画面里能看到髋部后重试",
+                )
             }
             return
         }

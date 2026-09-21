@@ -59,13 +59,80 @@ class PostureGeometryTest {
 
     @Test
     fun analyze_usesPixelCoordinates_notNormalized() {
-        // 归一化坐标下 dx=0.1、dy=0.1 看似 45 度，但图像 640x480 时实际 dx=64、dy=48
+        // 归一化坐标下 dx=0.1、dy=0.1 看似 45 度，但图像 640x480 时实际 dx=64、dy=48。
+        // 默认髋在肩正下方，躯干竖直，所以相对躯干线的角度与相对竖直线相同。
         val lm = sideView(earX = 0.6f, earY = 0.4f, shoulderX = 0.5f, shoulderY = 0.5f)
         val result = PostureGeometry.analyze(lm, 640, 480)
         assertTrue(result is FrameResult.Valid)
         val m = (result as FrameResult.Valid).measurement
         val expected = Math.toDegrees(Math.atan2(64.0, 48.0)).toFloat()
         assertEquals(expected, m.neckInclinationDeg, 0.01f)
+        assertEquals(NeckReference.TORSO, m.neckReference)
+    }
+
+    @Test
+    fun analyze_neckIsZero_whenHeadAlignedWithTorso_lyingDown() {
+        // 躺平：髋、肩、耳在一条水平线上，头并没有相对身体前伸
+        val lm = sideView(earX = 0.7f, earY = 0.5f, shoulderX = 0.5f, shoulderY = 0.5f, hipX = 0.2f, hipY = 0.5f)
+        val result = PostureGeometry.analyze(lm, 400, 400) as FrameResult.Valid
+        assertEquals(0f, result.measurement.neckInclinationDeg, 1e-2f)
+        // 旧口径（相对竖直线）在这里是 90 度，正是误报的来源
+        assertEquals(90f, result.measurement.torsoInclinationDeg!!, 1e-2f)
+    }
+
+    @Test
+    fun analyze_neckSubtractsTorsoLean() {
+        // 躯干前倾：髋在肩的右下方，耳相对躯干线再偏 45 度
+        val lm = sideView(earX = 0.5f, earY = 0.3f, shoulderX = 0.5f, shoulderY = 0.5f, hipX = 0.7f, hipY = 0.7f)
+        val result = PostureGeometry.analyze(lm, 100, 100) as FrameResult.Valid
+        // 躯干方向 hip->shoulder 指向左上 45 度，颈部方向 shoulder->ear 竖直向上，夹角 45 度
+        assertEquals(45f, result.measurement.neckInclinationDeg, 1e-2f)
+        assertEquals(45f, result.measurement.torsoInclinationDeg!!, 1e-2f)
+    }
+
+    @Test
+    fun analyze_noTorso_whenHipHidden_byDefault() {
+        val lm = sideView(earX = 0.5f, earY = 0.3f, shoulderX = 0.5f, shoulderY = 0.5f, hipX = null, hipY = null)
+        val result = PostureGeometry.analyze(lm, 100, 100)
+        assertTrue(result is FrameResult.NoTorso)
+        val m = (result as FrameResult.NoTorso).measurement
+        assertEquals(NeckReference.VERTICAL, m.neckReference)
+        assertEquals(0f, m.neckInclinationDeg, 1e-3f)
+    }
+
+    @Test
+    fun analyze_fallsBackToVertical_whenRequireHipDisabled() {
+        val lm = sideView(earX = 0.5f, earY = 0.3f, shoulderX = 0.5f, shoulderY = 0.5f, hipX = null, hipY = null)
+        val config = GeometryConfig(requireHip = false)
+        val result = PostureGeometry.analyze(lm, 100, 100, config)
+        assertTrue(result is FrameResult.Valid)
+        assertEquals(NeckReference.VERTICAL, (result as FrameResult.Valid).measurement.neckReference)
+    }
+
+    @Test
+    fun analyze_noTorso_whenHipTooCloseToShoulder() {
+        // 髋点几乎落在肩上，躯干方向不可靠
+        val lm = sideView(earX = 0.5f, earY = 0.3f, shoulderX = 0.5f, shoulderY = 0.5f, hipX = 0.5f, hipY = 0.52f)
+        val result = PostureGeometry.analyze(lm, 100, 100)
+        assertTrue(result is FrameResult.NoTorso)
+        // 髋点本身仍然回传，UI 照常画出来
+        assertEquals(NeckReference.VERTICAL, (result as FrameResult.NoTorso).measurement.neckReference)
+    }
+
+    @Test
+    fun angleBetween_zeroWhenCollinear_and90WhenPerpendicular() {
+        val origin = PixelPoint(0f, 0f)
+        val right = PixelPoint(10f, 0f)
+        val up = PixelPoint(0f, -10f)
+        assertEquals(0f, PostureGeometry.angleBetween(origin, right, origin, right), 1e-3f)
+        assertEquals(90f, PostureGeometry.angleBetween(origin, right, origin, up), 1e-3f)
+        assertEquals(180f, PostureGeometry.angleBetween(origin, right, right, origin), 1e-3f)
+    }
+
+    @Test
+    fun angleBetween_zeroForDegenerateVector() {
+        val p = PixelPoint(5f, 5f)
+        assertEquals(0f, PostureGeometry.angleBetween(p, p, PixelPoint(0f, 0f), PixelPoint(1f, 1f)), 1e-3f)
     }
 
     @Test
@@ -107,7 +174,7 @@ class PostureGeometryTest {
     @Test
     fun analyze_torsoNull_whenHipHidden() {
         val lm = sideView(earX = 0.5f, earY = 0.3f, shoulderX = 0.5f, shoulderY = 0.5f, hipX = null, hipY = null)
-        val result = PostureGeometry.analyze(lm, 100, 100) as FrameResult.Valid
+        val result = PostureGeometry.analyze(lm, 100, 100) as FrameResult.NoTorso
         assertEquals(null, result.measurement.torsoInclinationDeg)
         assertEquals(null, result.measurement.hip)
     }

@@ -52,7 +52,7 @@ class AlertNotifier(private val context: Context) {
             return
         }
         val body = buildString {
-            append("颈部倾角 ")
+            append("前倾角 ")
             append(neckDeg?.let { String.format(Locale.US, "%.1f°", it) } ?: "--")
             thresholdDeg?.let { append("，阈值 ").append(String.format(Locale.US, "%.0f°", it)) }
             append("，请抬头收下巴。")
@@ -104,7 +104,7 @@ class AlertNotifier(private val context: Context) {
         if (!canPost()) return
         val seconds = (forwardHeadMillis / 1000L).coerceAtLeast(0L)
         val body = buildString {
-            append("颈部倾角 ")
+            append("前倾角 ")
             append(neckDeg?.let { String.format(Locale.US, "%.1f°", it) } ?: "--")
             if (seconds > 0) append("，前倾持续 ").append(seconds).append(" 秒")
             append("。")

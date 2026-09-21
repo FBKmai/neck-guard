@@ -476,7 +476,8 @@ class MonitorService : LifecycleService() {
                 torsoDeg = s.medianTorsoDeg,
                 thresholdDeg = s.thresholdDeg,
                 message = "有效帧 ${s.validFrames}/${s.totalFrames}" +
-                    if (s.misalignedFrames > 0) "，未对齐 ${s.misalignedFrames}" else "",
+                    (if (s.misalignedFrames > 0) "，未对齐 ${s.misalignedFrames}" else "") +
+                    (if (s.noTorsoFrames > 0) "，髋不可见 ${s.noTorsoFrames}" else ""),
                 snapshotPaths = listOfNotNull(windowSnapshot?.absolutePath),
                 verdict = s.verdict.name,
             ),
@@ -649,6 +650,7 @@ class MonitorService : LifecycleService() {
     private fun frameResultText(result: FrameResult): String = when (result) {
         is FrameResult.Valid -> "已对齐"
         is FrameResult.Misaligned -> "未对齐"
+        is FrameResult.NoTorso -> "髋部不可见"
         FrameResult.LowVisibility -> "看不清耳肩"
         FrameResult.NoPerson -> "画面中无人"
     }

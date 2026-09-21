@@ -46,8 +46,17 @@ class PostureAnalyzerTest {
     fun threshold_absoluteWithoutBaseline_andClampedWithBaseline() {
         assertEquals(40f, PostureAnalyzer.thresholdFor(null, config), 1e-6f)
         assertEquals(37f, PostureAnalyzer.thresholdFor(25f, config), 1e-6f)
-        assertEquals(30f, PostureAnalyzer.thresholdFor(10f, config), 1e-6f)
+        // 默认 clamp 区间是 20..50（v0.5 起颈角相对躯干线，下限随之下调）
+        assertEquals(20f, PostureAnalyzer.thresholdFor(2f, config), 1e-6f)
         assertEquals(50f, PostureAnalyzer.thresholdFor(45f, config), 1e-6f)
+    }
+
+    @Test
+    fun defaultConfig_matchesTorsoRelativeThresholds() {
+        val defaults = AnalyzerConfig()
+        assertEquals(35f, defaults.absoluteThresholdDeg, 1e-6f)
+        assertEquals(20f, defaults.thresholdMinDeg, 1e-6f)
+        assertEquals(50f, defaults.thresholdMaxDeg, 1e-6f)
     }
 
     @Test
@@ -72,6 +81,21 @@ class PostureAnalyzerTest {
         )
         assertEquals(WindowVerdict.GOOD, outcome.summary.verdict)
         assertEquals(2, outcome.summary.misalignedFrames)
+        assertEquals(21f, outcome.summary.medianNeckDeg!!, 1e-6f)
+    }
+
+    @Test
+    fun noTorsoFrames_countedButNotValid() {
+        val analyzer = PostureAnalyzer(config)
+        val outcome = analyzer.runWindow(
+            0L, 20f, 21f, 22f,
+            extra = listOf(FrameResult.NoTorso(measurement(60f)), FrameResult.NoTorso(measurement(61f))),
+        )
+        assertEquals(WindowVerdict.GOOD, outcome.summary.verdict)
+        assertEquals(2, outcome.summary.noTorsoFrames)
+        assertEquals(0, outcome.summary.misalignedFrames)
+        assertEquals(3, outcome.summary.validFrames)
+        assertEquals(5, outcome.summary.totalFrames)
         assertEquals(21f, outcome.summary.medianNeckDeg!!, 1e-6f)
     }
 

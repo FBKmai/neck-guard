@@ -25,19 +25,33 @@ data class PixelPoint(val x: Float, val y: Float)
 
 enum class BodySide { LEFT, RIGHT }
 
+/** 颈部角度用的参考方向。 */
+enum class NeckReference {
+    /** 髋肩连线（躯干线）的延长方向，躺卧与身体倾斜时都不会误判。 */
+    TORSO,
+
+    /** 竖直向上，仅在髋不可见且允许回退时使用。 */
+    VERTICAL,
+}
+
 /** 单帧姿态测量结果。角度单位均为度。 */
 data class PostureMeasurement(
     val side: BodySide,
     val ear: PixelPoint,
     val shoulder: PixelPoint,
     val hip: PixelPoint?,
-    /** 耳肩连线与竖直向上方向的夹角，0 表示耳朵在肩正上方，越大越前倾。 */
+    /**
+     * 颈部前倾角：耳肩连线与参考方向的夹角，0 表示头在躯干延长线上。
+     * 参考方向见 [neckReference]，默认是髋肩连线的延长方向。
+     */
     val neckInclinationDeg: Float,
-    /** 髋肩连线与竖直向上方向的夹角，髋不可见时为 null。 */
+    /** 髋肩连线与竖直向上方向的夹角，髋不可见时为 null。仅用于显示与记录。 */
     val torsoInclinationDeg: Float?,
     /** 左右肩水平距离 / 躯干长度，用于判断摄像头是否在正侧面。 */
     val shoulderOffsetRatio: Float,
     val aligned: Boolean,
+    /** [neckInclinationDeg] 用的参考方向。 */
+    val neckReference: NeckReference = NeckReference.TORSO,
 )
 
 sealed class FrameResult {
@@ -46,6 +60,12 @@ sealed class FrameResult {
 
     /** 关键点可见但摄像头不在正侧面，仅供 UI 提示摆放角度。 */
     data class Misaligned(val measurement: PostureMeasurement) : FrameResult()
+
+    /**
+     * 耳肩可见但髋不可见（或髋肩距离太短不可靠），没有躯干参考线。
+     * measurement 里的角度退化为竖直参考，只供 UI 显示，不参与判定。
+     */
+    data class NoTorso(val measurement: PostureMeasurement) : FrameResult()
 
     /** 耳或肩 visibility 过低。 */
     data object LowVisibility : FrameResult()
@@ -57,6 +77,7 @@ sealed class FrameResult {
         get() = when (this) {
             is Valid -> measurement
             is Misaligned -> measurement
+            is NoTorso -> measurement
             else -> null
         }
 }
@@ -64,6 +85,16 @@ sealed class FrameResult {
 data class GeometryConfig(
     val minVisibility: Float = 0.5f,
     val maxShoulderOffsetRatio: Float = 0.35f,
+    /**
+     * 是否必须有躯干线才判定。
+     * true（默认）：髋不可见时该帧记为 [FrameResult.NoTorso]，不参与判定；
+     * false：退回竖直参考并照常判定，适合髋部长期被桌子挡住的场景。
+     */
+    val requireHip: Boolean = true,
+    /**
+     * 髋肩距离至少要有耳肩距离的多少倍，低于此值认为髋点落在肩上、方向不可靠。
+     */
+    val minTorsoToNeckRatio: Float = 0.8f,
 )
 
 /**
@@ -83,6 +114,30 @@ object PostureGeometry {
         val cos = ((from.y - to.y) / len).coerceIn(-1f, 1f)
         return Math.toDegrees(acos(cos).toDouble()).toFloat()
     }
+
+    /**
+     * 两个向量 (a1 -> a2) 与 (b1 -> b2) 的夹角，单位度，范围 0..180。
+     * 任一向量长度为 0 时返回 0。
+     */
+    fun angleBetween(a1: PixelPoint, a2: PixelPoint, b1: PixelPoint, b2: PixelPoint): Float {
+        val ax = a2.x - a1.x
+        val ay = a2.y - a1.y
+        val bx = b2.x - b1.x
+        val by = b2.y - b1.y
+        val la = hypot(ax, ay)
+        val lb = hypot(bx, by)
+        if (la < 1e-4f || lb < 1e-4f) return 0f
+        val cos = ((ax * bx + ay * by) / (la * lb)).coerceIn(-1f, 1f)
+        return Math.toDegrees(acos(cos).toDouble()).toFloat()
+    }
+
+    /**
+     * 颈部前倾角：耳肩连线与躯干延长线的夹角。
+     * 躯干方向取 hip -> shoulder，颈部方向取 shoulder -> ear，
+     * 头与身体共线（包括躺平）时为 0，头越往躯干前方伸角度越大。
+     */
+    fun neckRelativeToTorso(hip: PixelPoint, shoulder: PixelPoint, ear: PixelPoint): Float =
+        angleBetween(hip, shoulder, shoulder, ear)
 
     fun distance(a: PixelPoint, b: PixelPoint): Float = hypot(b.x - a.x, b.y - a.y)
 
@@ -120,13 +175,22 @@ object PostureGeometry {
         val ear = toPixel(earLm)
         val shoulder = toPixel(shoulderLm)
         val hipLm = landmarks[hipIdx]
-        val hip = if (hipLm.visibility >= config.minVisibility) toPixel(hipLm) else null
+        val hipVisible = if (hipLm.visibility >= config.minVisibility) toPixel(hipLm) else null
         val farShoulderLm = landmarks[farShoulderIdx]
 
-        val neck = inclinationFromVertical(shoulder, ear)
-        val torso = hip?.let { inclinationFromVertical(it, shoulder) }
+        val neckLen = distance(ear, shoulder)
+        // 髋点落在肩膀附近时躯干方向是噪声，宁可当成没有躯干线
+        val hip = hipVisible?.takeIf { distance(shoulder, it) >= neckLen * config.minTorsoToNeckRatio }
+        val torso = hipVisible?.let { inclinationFromVertical(it, shoulder) }
 
-        val torsoLen = if (hip != null) distance(shoulder, hip) else distance(ear, shoulder) * 2f
+        val reference = if (hip != null) NeckReference.TORSO else NeckReference.VERTICAL
+        val neck = if (hip != null) {
+            neckRelativeToTorso(hip, shoulder, ear)
+        } else {
+            inclinationFromVertical(shoulder, ear)
+        }
+
+        val torsoLen = if (hipVisible != null) distance(shoulder, hipVisible) else neckLen * 2f
         val offsetRatio = if (farShoulderLm.visibility < config.minVisibility || torsoLen < 1e-3f) {
             // 远侧肩膀被身体挡住，恰好说明是正侧面
             0f
@@ -139,12 +203,18 @@ object PostureGeometry {
             side = side,
             ear = ear,
             shoulder = shoulder,
-            hip = hip,
+            hip = hipVisible,
             neckInclinationDeg = neck,
             torsoInclinationDeg = torso,
             shoulderOffsetRatio = offsetRatio,
             aligned = aligned,
+            neckReference = reference,
         )
-        return if (aligned) FrameResult.Valid(measurement) else FrameResult.Misaligned(measurement)
+        return when {
+            // 对齐问题优先提示：摆放不对时算出来的角度本来也不可信
+            !aligned -> FrameResult.Misaligned(measurement)
+            hip == null && config.requireHip -> FrameResult.NoTorso(measurement)
+            else -> FrameResult.Valid(measurement)
+        }
     }
 }

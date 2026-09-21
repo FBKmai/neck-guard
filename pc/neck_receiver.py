@@ -296,7 +296,7 @@ def handle_event(cfg: Config, event: dict, snapshot: Optional[bytes]) -> None:
         title = "仍在前倾"
     else:
         title = "检测到头部前倾"
-    body = f"颈部倾角 {neck}，阈值 {thr}，{when.strftime('%H:%M:%S')}"
+    body = f"前倾角 {neck}，阈值 {thr}，{when.strftime('%H:%M:%S')}"
     if msg:
         body += f"，{msg}"
 

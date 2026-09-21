@@ -11,8 +11,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from posture_geometry import (  # noqa: E402
     BAD, GOOD, INVALID, LANDMARK_COUNT, LEFT_EAR, LEFT_HIP, LEFT_SHOULDER, LOW_VISIBILITY, MISALIGNED,
-    NO_PERSON, RIGHT_EAR, RIGHT_HIP, RIGHT_SHOULDER, VALID, AnalyzerConfig, Landmark, Measurement,
-    PostureAnalyzer, analyze, inclination_from_vertical, median, threshold_for,
+    NO_PERSON, NO_TORSO, REF_TORSO, REF_VERTICAL, RIGHT_EAR, RIGHT_HIP, RIGHT_SHOULDER, VALID,
+    AnalyzerConfig, GeometryConfig, Landmark, Measurement, PostureAnalyzer, analyze, angle_between,
+    inclination_from_vertical, median, threshold_for,
 )
 
 
@@ -57,11 +58,49 @@ class GeometryTest(unittest.TestCase):
         self.assertAlmostEqual(left, right, places=4)
 
     def test_analyze_uses_pixel_coordinates(self):
-        # 归一化 dx=0.1, dy=0.1 看似 45 度，640x480 下实际 dx=64, dy=48
+        # 归一化 dx=0.1, dy=0.1 看似 45 度，640x480 下实际 dx=64, dy=48。
+        # 默认髋在肩正下方，躯干竖直，所以相对躯干线与相对竖直线数值相同。
         lms = side_view(0.6, 0.4, 0.5, 0.5)
         status, m = analyze(lms, 640, 480)
         self.assertEqual(status, VALID)
         self.assertAlmostEqual(m.neck_deg, math.degrees(math.atan2(64, 48)), places=2)
+        self.assertEqual(m.neck_reference, REF_TORSO)
+
+    def test_angle_between_collinear_and_perpendicular(self):
+        self.assertAlmostEqual(angle_between((0, 0), (10, 0), (0, 0), (10, 0)), 0.0, places=3)
+        self.assertAlmostEqual(angle_between((0, 0), (10, 0), (0, 0), (0, -10)), 90.0, places=3)
+        self.assertAlmostEqual(angle_between((0, 0), (10, 0), (10, 0), (0, 0)), 180.0, places=3)
+
+    def test_angle_between_zero_for_degenerate_vector(self):
+        self.assertAlmostEqual(angle_between((5, 5), (5, 5), (0, 0), (1, 1)), 0.0, places=3)
+
+    def test_analyze_neck_zero_when_lying_down(self):
+        # 躺平：髋、肩、耳共线，头没有相对身体前伸
+        lms = side_view(0.7, 0.5, 0.5, 0.5, hip_x=0.2, hip_y=0.5)
+        status, m = analyze(lms, 400, 400)
+        self.assertEqual(status, VALID)
+        self.assertAlmostEqual(m.neck_deg, 0.0, places=2)
+        # 旧口径（相对竖直线）在这里是 90 度，正是误报的来源
+        self.assertAlmostEqual(m.torso_deg, 90.0, places=2)
+
+    def test_analyze_neck_subtracts_torso_lean(self):
+        lms = side_view(0.5, 0.3, 0.5, 0.5, hip_x=0.7, hip_y=0.7)
+        status, m = analyze(lms, 100, 100)
+        self.assertEqual(status, VALID)
+        self.assertAlmostEqual(m.neck_deg, 45.0, places=2)
+        self.assertAlmostEqual(m.torso_deg, 45.0, places=2)
+
+    def test_analyze_falls_back_to_vertical_when_require_hip_disabled(self):
+        lms = side_view(0.5, 0.3, 0.5, 0.5, hip_x=None, hip_y=None)
+        status, m = analyze(lms, 100, 100, GeometryConfig(require_hip=False))
+        self.assertEqual(status, VALID)
+        self.assertEqual(m.neck_reference, REF_VERTICAL)
+
+    def test_analyze_no_torso_when_hip_too_close_to_shoulder(self):
+        lms = side_view(0.5, 0.3, 0.5, 0.5, hip_x=0.5, hip_y=0.52)
+        status, m = analyze(lms, 100, 100)
+        self.assertEqual(status, NO_TORSO)
+        self.assertEqual(m.neck_reference, REF_VERTICAL)
 
     def test_analyze_picks_right_side(self):
         lms = side_view(0.5, 0.3, 0.5, 0.5, side="RIGHT")
@@ -93,9 +132,11 @@ class GeometryTest(unittest.TestCase):
     def test_analyze_torso_none_when_hip_hidden(self):
         lms = side_view(0.5, 0.3, 0.5, 0.5, hip_x=None, hip_y=None)
         status, m = analyze(lms, 100, 100)
-        self.assertEqual(status, VALID)
+        self.assertEqual(status, NO_TORSO)
         self.assertIsNone(m.torso_deg)
         self.assertIsNone(m.hip)
+        self.assertEqual(m.neck_reference, REF_VERTICAL)
+        self.assertAlmostEqual(m.neck_deg, 0.0, places=3)
 
     def test_analyze_torso_from_hip(self):
         lms = side_view(0.5, 0.3, 0.5, 0.5, hip_x=0.5, hip_y=0.8)
@@ -136,8 +177,15 @@ class AnalyzerTest(unittest.TestCase):
     def test_threshold_absolute_and_clamped(self):
         self.assertAlmostEqual(threshold_for(None, CFG), 40.0)
         self.assertAlmostEqual(threshold_for(25.0, CFG), 37.0)
-        self.assertAlmostEqual(threshold_for(10.0, CFG), 30.0)
+        # 默认 clamp 区间是 20..50（v0.5 起颈角相对躯干线，下限随之下调）
+        self.assertAlmostEqual(threshold_for(2.0, CFG), 20.0)
         self.assertAlmostEqual(threshold_for(45.0, CFG), 50.0)
+
+    def test_default_config_matches_torso_relative_thresholds(self):
+        d = AnalyzerConfig()
+        self.assertAlmostEqual(d.absolute_threshold_deg, 35.0)
+        self.assertAlmostEqual(d.threshold_min_deg, 20.0)
+        self.assertAlmostEqual(d.threshold_max_deg, 50.0)
 
     def test_invalid_window_does_not_touch_streak(self):
         a = PostureAnalyzer(CFG)
@@ -155,6 +203,16 @@ class AnalyzerTest(unittest.TestCase):
         o = run_window(a, 0, 20, 21, 22, extra=[(MISALIGNED, meas(60)), (MISALIGNED, meas(61))])
         self.assertEqual(o["verdict"], GOOD)
         self.assertEqual(o["misaligned"], 2)
+        self.assertAlmostEqual(o["median_neck"], 21.0)
+
+    def test_no_torso_frames_counted_but_not_valid(self):
+        a = PostureAnalyzer(CFG)
+        o = run_window(a, 0, 20, 21, 22, extra=[(NO_TORSO, meas(60)), (NO_TORSO, meas(61))])
+        self.assertEqual(o["verdict"], GOOD)
+        self.assertEqual(o["no_torso"], 2)
+        self.assertEqual(o["misaligned"], 0)
+        self.assertEqual(o["valid"], 3)
+        self.assertEqual(o["total"], 5)
         self.assertAlmostEqual(o["median_neck"], 21.0)
 
     def test_alert_only_after_k_consecutive_bad(self):

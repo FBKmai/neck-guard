@@ -56,13 +56,16 @@ data class Settings(
     val retriggerHoldSec: Int = 30,
     /** 确认模式内连续多少个无效窗退回巡检。 */
     val maxInvalidWindows: Int = 2,
-    val absoluteThresholdDeg: Float = 40f,
+    /** 未校准时的绝对阈值。v0.5 起颈角相对躯干线，默认值比旧的竖直口径低。 */
+    val absoluteThresholdDeg: Float = 35f,
     val calibrationDeltaDeg: Float = 12f,
     val hysteresisDeg: Float = 4f,
     val minValidFrames: Int = 8,
     val consecutiveBadWindows: Int = 2,
     val cooldownMin: Int = 10,
     val maxShoulderOffsetRatio: Float = 0.35f,
+    /** 关闭时，髋不可见的帧退回竖直参考继续判定；打开（默认）则跳过这些帧。 */
+    val requireHip: Boolean = true,
     /** null 表示未校准。 */
     val baselineDeg: Float? = null,
     val recoveredNotify: RecoveredNotify = RecoveredNotify.PHONE,
@@ -100,7 +103,10 @@ data class Settings(
         maxInvalidWindows = maxInvalidWindows,
     ).sanitized()
 
-    fun toGeometryConfig(): GeometryConfig = GeometryConfig(maxShoulderOffsetRatio = maxShoulderOffsetRatio)
+    fun toGeometryConfig(): GeometryConfig = GeometryConfig(
+        maxShoulderOffsetRatio = maxShoulderOffsetRatio,
+        requireHip = requireHip,
+    )
 }
 
 class SettingsRepository(private val context: Context) {
@@ -124,11 +130,18 @@ class SettingsRepository(private val context: Context) {
         val CONSECUTIVE_BAD = intPreferencesKey("consecutive_bad_windows")
         val COOLDOWN_MIN = intPreferencesKey("cooldown_min")
         val MAX_SHOULDER_OFFSET = floatPreferencesKey("max_shoulder_offset_ratio")
+        val REQUIRE_HIP = booleanPreferencesKey("require_hip")
         val BASELINE = floatPreferencesKey("baseline_deg")
         val RECOVERED_NOTIFY = stringPreferencesKey("recovered_notify")
         val PC_ENDPOINT = stringPreferencesKey("pc_endpoint")
         val PC_TOKEN = stringPreferencesKey("pc_token")
         val PC_ENABLED = booleanPreferencesKey("pc_enabled")
+
+        /**
+         * 颈角定义的版本。缺失或小于 [GEOMETRY_VERSION] 时说明存的是旧口径，
+         * 旧基线与旧阈值在新定义下没有意义，读取时一并重置。
+         */
+        val GEOMETRY_VERSION = intPreferencesKey("geometry_version")
 
         // v0.2 遗留 key，只读用于迁移，写入时清除
         val LEGACY_USE_FRONT_CAMERA = booleanPreferencesKey("use_front_camera")
@@ -161,10 +174,13 @@ class SettingsRepository(private val context: Context) {
             p[Keys.CONSECUTIVE_BAD] = new.consecutiveBadWindows
             p[Keys.COOLDOWN_MIN] = new.cooldownMin
             p[Keys.MAX_SHOULDER_OFFSET] = new.maxShoulderOffsetRatio
+            p[Keys.REQUIRE_HIP] = new.requireHip
             p[Keys.RECOVERED_NOTIFY] = new.recoveredNotify.name
             p[Keys.PC_ENDPOINT] = new.pcEndpoint
             p[Keys.PC_TOKEN] = new.pcToken
             p[Keys.PC_ENABLED] = new.pcEnabled
+            // 写入即表示这批值已是新口径，之后不再走迁移分支
+            p[Keys.GEOMETRY_VERSION] = GEOMETRY_VERSION
             val baseline = new.baselineDeg
             if (baseline == null) p.remove(Keys.BASELINE) else p[Keys.BASELINE] = baseline
             // 第一次写入即清掉 v0.2 的键，避免以后再走迁移分支
@@ -183,6 +199,9 @@ class SettingsRepository(private val context: Context) {
         val lens = CameraLens.parse(p[Keys.CAMERA_LENS])
             ?: p[Keys.LEGACY_USE_FRONT_CAMERA]?.let { if (it) CameraLens.FRONT else CameraLens.BACK }
             ?: d.cameraLens
+        // v0.4 及更早存的是"相对竖直线"的角度，基线与阈值在新定义下偏大，一律回到新默认值。
+        // 用户会在摆放页看到"未校准"提示，重新校准一次即可。
+        val legacyGeometry = (p[Keys.GEOMETRY_VERSION] ?: 1) < GEOMETRY_VERSION
         return Settings(
             cameraLens = lens,
             analysisResolution = AnalysisResolution.parse(p[Keys.ANALYSIS_RESOLUTION]) ?: d.analysisResolution,
@@ -194,18 +213,24 @@ class SettingsRepository(private val context: Context) {
             recoverFrames = p[Keys.RECOVER_FRAMES] ?: d.recoverFrames,
             retriggerHoldSec = p[Keys.RETRIGGER_HOLD_SEC] ?: d.retriggerHoldSec,
             maxInvalidWindows = p[Keys.MAX_INVALID_WINDOWS] ?: d.maxInvalidWindows,
-            absoluteThresholdDeg = p[Keys.ABSOLUTE_THRESHOLD] ?: d.absoluteThresholdDeg,
+            absoluteThresholdDeg = (if (legacyGeometry) null else p[Keys.ABSOLUTE_THRESHOLD]) ?: d.absoluteThresholdDeg,
             calibrationDeltaDeg = p[Keys.CALIBRATION_DELTA] ?: d.calibrationDeltaDeg,
             hysteresisDeg = p[Keys.HYSTERESIS] ?: d.hysteresisDeg,
             minValidFrames = p[Keys.MIN_VALID_FRAMES] ?: d.minValidFrames,
             consecutiveBadWindows = p[Keys.CONSECUTIVE_BAD] ?: d.consecutiveBadWindows,
             cooldownMin = p[Keys.COOLDOWN_MIN] ?: d.cooldownMin,
             maxShoulderOffsetRatio = p[Keys.MAX_SHOULDER_OFFSET] ?: d.maxShoulderOffsetRatio,
-            baselineDeg = p[Keys.BASELINE],
+            requireHip = p[Keys.REQUIRE_HIP] ?: d.requireHip,
+            baselineDeg = if (legacyGeometry) null else p[Keys.BASELINE],
             recoveredNotify = RecoveredNotify.parse(p[Keys.RECOVERED_NOTIFY]) ?: d.recoveredNotify,
             pcEndpoint = p[Keys.PC_ENDPOINT] ?: d.pcEndpoint,
             pcToken = p[Keys.PC_TOKEN] ?: d.pcToken,
             pcEnabled = p[Keys.PC_ENABLED] ?: d.pcEnabled,
         )
+    }
+
+    companion object {
+        /** 2 = 颈角相对躯干线（v0.5 起）；1 = 相对竖直线（v0.4 及更早）。 */
+        const val GEOMETRY_VERSION = 2
     }
 }

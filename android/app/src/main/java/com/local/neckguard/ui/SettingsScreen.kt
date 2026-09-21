@@ -162,6 +162,12 @@ fun SettingsScreen(
 
         HorizontalDivider()
         Text("判定阈值", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "前倾角 = 耳肩连线与髋肩连线（躯干线）的夹角。头与身体成一条直线时为 0°，" +
+                "所以躺着或身体整体前倾都不会误报，只有头相对躯干往前伸才算。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("当前基线")
@@ -179,7 +185,7 @@ fun SettingsScreen(
         }
         FloatField(
             label = "绝对阈值（度）",
-            hint = "未校准时颈部倾角超过此值判为前倾，默认 40",
+            hint = "未校准时前倾角超过此值判为前倾，默认 35",
             value = settings.absoluteThresholdDeg,
             validate = { it in 10f..80f },
             onSave = { v -> save { it.copy(absoluteThresholdDeg = v) } },
@@ -187,7 +193,7 @@ fun SettingsScreen(
         )
         FloatField(
             label = "校准增量（度）",
-            hint = "校准后阈值 = 基线 + 增量，再限制在 30 到 50 度之间，默认 12",
+            hint = "校准后阈值 = 基线 + 增量，再限制在 20 到 50 度之间，默认 12",
             value = settings.calibrationDeltaDeg,
             validate = { it in 0f..40f },
             onSave = { v -> save { it.copy(calibrationDeltaDeg = v) } },
@@ -224,6 +230,13 @@ fun SettingsScreen(
             validate = { it in 0.05f..1f },
             onSave = { v -> save { it.copy(maxShoulderOffsetRatio = v) } },
             onInvalid = { message = it },
+        )
+        SwitchRow(
+            label = "必须看到髋部",
+            hint = "开启（默认）时髋不可见的帧不参与判定；关闭则退回「与竖直线的夹角」继续判定，" +
+                "适合髋部长期被桌子挡住，但躺卧时会误报",
+            checked = settings.requireHip,
+            onChange = { v -> save { it.copy(requireHip = v) } },
         )
 
         HorizontalDivider()
@@ -405,7 +418,18 @@ fun SettingsScreen(
         HorizontalDivider()
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(
-                onClick = { save { Settings(baselineDeg = it.baselineDeg, cameraLens = it.cameraLens) } },
+                // 基线、镜头与电脑接收端配置是用户一次性设好的，不该被"恢复默认"清掉
+                onClick = {
+                    save {
+                        Settings(
+                            baselineDeg = it.baselineDeg,
+                            cameraLens = it.cameraLens,
+                            pcEndpoint = it.pcEndpoint,
+                            pcToken = it.pcToken,
+                            pcEnabled = it.pcEnabled,
+                        )
+                    }
+                },
                 modifier = Modifier.weight(1f),
             ) {
                 Text("恢复默认")

@@ -4,11 +4,14 @@ import kotlin.math.abs
 
 /** 判定参数，全部可在设置页调整。角度单位度，时间单位毫秒。 */
 data class AnalyzerConfig(
-    /** 未校准时使用的绝对阈值。 */
-    val absoluteThresholdDeg: Float = 40f,
+    /**
+     * 未校准时使用的绝对阈值。
+     * v0.5 起颈角相对躯干线计算，伏案时躯干本身的前倾不再计入，所以比旧的竖直口径低。
+     */
+    val absoluteThresholdDeg: Float = 35f,
     /** 校准后阈值 = 基线 + delta。 */
     val calibrationDeltaDeg: Float = 12f,
-    val thresholdMinDeg: Float = 30f,
+    val thresholdMinDeg: Float = 20f,
     val thresholdMaxDeg: Float = 50f,
     /** 迟滞：进入前倾需 > 阈值，退出需 < 阈值 - hysteresis。 */
     val hysteresisDeg: Float = 4f,
@@ -30,6 +33,8 @@ data class WindowSummary(
     val totalFrames: Int,
     val validFrames: Int,
     val misalignedFrames: Int,
+    /** 髋不可见、没有躯干参考线而被跳过的帧数。 */
+    val noTorsoFrames: Int = 0,
     /** 角度最接近中位数的有效帧序号（addFrame 返回的序号），用于选快照。 */
     val representativeFrameIndex: Int?,
     val representative: PostureMeasurement?,
@@ -79,6 +84,7 @@ class PostureAnalyzer(config: AnalyzerConfig = AnalyzerConfig()) {
     private val validFrames = ArrayList<Pair<Int, PostureMeasurement>>()
     private var totalFrames = 0
     private var misalignedFrames = 0
+    private var noTorsoFrames = 0
     private var frameCounter = 0
 
     @Synchronized
@@ -86,6 +92,7 @@ class PostureAnalyzer(config: AnalyzerConfig = AnalyzerConfig()) {
         validFrames.clear()
         totalFrames = 0
         misalignedFrames = 0
+        noTorsoFrames = 0
         frameCounter = 0
     }
 
@@ -97,6 +104,7 @@ class PostureAnalyzer(config: AnalyzerConfig = AnalyzerConfig()) {
         when (result) {
             is FrameResult.Valid -> validFrames.add(index to result.measurement)
             is FrameResult.Misaligned -> misalignedFrames++
+            is FrameResult.NoTorso -> noTorsoFrames++
             FrameResult.LowVisibility, FrameResult.NoPerson -> Unit
         }
         return index
@@ -116,6 +124,7 @@ class PostureAnalyzer(config: AnalyzerConfig = AnalyzerConfig()) {
                 totalFrames = totalFrames,
                 validFrames = validFrames.size,
                 misalignedFrames = misalignedFrames,
+                noTorsoFrames = noTorsoFrames,
                 representativeFrameIndex = null,
                 representative = null,
             )
@@ -153,6 +162,7 @@ class PostureAnalyzer(config: AnalyzerConfig = AnalyzerConfig()) {
             totalFrames = totalFrames,
             validFrames = validFrames.size,
             misalignedFrames = misalignedFrames,
+            noTorsoFrames = noTorsoFrames,
             representativeFrameIndex = representative?.first,
             representative = representative?.second,
             badFrames = badFrames,

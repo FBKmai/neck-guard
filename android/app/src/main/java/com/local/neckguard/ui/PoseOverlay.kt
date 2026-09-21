@@ -7,7 +7,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import com.local.neckguard.pose.FrameResult
+import com.local.neckguard.pose.NeckReference
 import com.local.neckguard.pose.PostureMeasurement
+import kotlin.math.hypot
 
 /**
  * 在预览上画耳肩髋连线。预览用 FIT_CENTER，因此按图像宽高比算出居中矩形再映射。
@@ -54,11 +56,24 @@ fun PoseOverlay(
         val shoulder = map(m.shoulder.x, m.shoulder.y)
         val hip = m.hip?.let { map(it.x, it.y) }
 
-        // 竖直参考线
+        // 参考线：颈角以它为基准。有髋就沿躯干延长，否则退回竖直。
+        val neckLen = hypot(ear.x - shoulder.x, ear.y - shoulder.y).coerceAtLeast(stroke * 4)
+        val refEnd = if (m.neckReference == NeckReference.TORSO && hip != null) {
+            val dx = shoulder.x - hip.x
+            val dy = shoulder.y - hip.y
+            val len = hypot(dx, dy)
+            if (len < 1e-3f) {
+                Offset(shoulder.x, shoulder.y - neckLen)
+            } else {
+                Offset(shoulder.x + dx / len * neckLen * 1.2f, shoulder.y + dy / len * neckLen * 1.2f)
+            }
+        } else {
+            Offset(shoulder.x, shoulder.y - neckLen)
+        }
         drawLine(
             color = Color.White.copy(alpha = 0.6f),
             start = shoulder,
-            end = Offset(shoulder.x, ear.y - stroke * 4),
+            end = refEnd,
             strokeWidth = stroke / 2,
         )
         hip?.let { drawLine(lineColor, it, shoulder, stroke, StrokeCap.Round) }
