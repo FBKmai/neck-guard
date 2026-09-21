@@ -331,6 +331,17 @@ class PoseBackend:
         pass
 
 
+def _ultralytics_at_least(major: int, minor: int) -> bool:
+    """判断已装的 ultralytics 是否到某个版本。读不到版本号时按新版处理。"""
+    try:
+        import ultralytics
+
+        parts = str(ultralytics.__version__).split(".")
+        return (int(parts[0]), int(parts[1])) >= (major, minor)
+    except (ImportError, AttributeError, IndexError, ValueError):
+        return True
+
+
 class YoloBackend(PoseBackend):
     """Ultralytics YOLO26-pose。COCO 17 点按 COCO_TO_MP 映射成几何模块要的 33 点。"""
 
@@ -363,6 +374,11 @@ class YoloBackend(PoseBackend):
         self.half = half and self.device != "cpu"
         self.conf = conf
         self._fail_streak = 0
+        # ultralytics 8.4 起 half=True 改成 quantize="fp16"，传旧参数会刷废弃警告。
+        # predict 的签名是 **kwargs，探测不到参数名，所以按版本号判断。
+        self._precision: Dict[str, object] = {}
+        if self.half:
+            self._precision = {"quantize": "fp16"} if _ultralytics_at_least(8, 4) else {"half": True}
 
     @staticmethod
     def _auto_device() -> str:
@@ -396,7 +412,7 @@ class YoloBackend(PoseBackend):
     def infer(self, bgr) -> Optional[List[pg.Landmark]]:
         try:
             results = self.model(bgr, imgsz=self.imgsz, conf=self.conf, device=self.device,
-                                 half=self.half, verbose=False)
+                                 verbose=False, **self._precision)
             self._fail_streak = 0
         except Exception as e:  # noqa: BLE001
             self._fail_streak += 1
