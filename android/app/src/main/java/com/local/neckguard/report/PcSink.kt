@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.BufferedOutputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
@@ -68,6 +69,10 @@ class PcSink(
         var conn: HttpURLConnection? = null
         try {
             val boundary = "----NeckGuard" + UUID.randomUUID().toString().replace("-", "")
+            // 先在内存里拼好整个 body，才能给出 Content-Length。
+            // 接收端 neck_receiver.py 按 Content-Length 读取，不支持 chunked，
+            // 所以这里不能用 setChunkedStreamingMode。截图通常几十 KB，内存可控。
+            val body = buildMultipartBody(boundary, event, snapshot, wireType)
             conn = (URL("$baseUrl/api/posture/events").openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 doOutput = true
@@ -76,28 +81,15 @@ class PcSink(
                 readTimeout = readTimeoutMillis
                 setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
                 if (token.isNotBlank()) setRequestProperty(HEADER_TOKEN, token)
-                setChunkedStreamingMode(0)
+                setFixedLengthStreamingMode(body.size)
             }
             BufferedOutputStream(conn.outputStream).use { out ->
-                fun writeAscii(s: String) = out.write(s.toByteArray(Charsets.UTF_8))
-                writeAscii("--$boundary\r\n")
-                writeAscii("Content-Disposition: form-data; name=\"event\"\r\n")
-                writeAscii("Content-Type: application/json; charset=utf-8\r\n\r\n")
-                writeAscii(toWireJson(event, wireType).toString())
-                writeAscii("\r\n")
-                if (snapshot != null && snapshot.isFile) {
-                    writeAscii("--$boundary\r\n")
-                    writeAscii("Content-Disposition: form-data; name=\"snapshot\"; filename=\"${snapshot.name}\"\r\n")
-                    writeAscii("Content-Type: image/jpeg\r\n\r\n")
-                    snapshot.inputStream().use { it.copyTo(out) }
-                    writeAscii("\r\n")
-                }
-                writeAscii("--$boundary--\r\n")
+                out.write(body)
                 out.flush()
             }
             val code = conn.responseCode
-            val body = readBody(conn)
-            if (code in 200..299) Result.Ok(body) else Result.Failed("HTTP $code $body")
+            val responseBody = readBody(conn)
+            if (code in 200..299) Result.Ok(responseBody) else Result.Failed("HTTP $code $responseBody")
         } catch (e: IOException) {
             Result.Failed(describe(e))
         } catch (e: Exception) {
@@ -105,6 +97,31 @@ class PcSink(
         } finally {
             conn?.disconnect()
         }
+    }
+
+    /** 拼 multipart 请求体。截图以流式读入，避免整张图再多一份拷贝。 */
+    private fun buildMultipartBody(
+        boundary: String,
+        event: PostureEvent,
+        snapshot: File?,
+        wireType: String,
+    ): ByteArray {
+        val buffer = ByteArrayOutputStream()
+        fun writeAscii(s: String) = buffer.write(s.toByteArray(Charsets.UTF_8))
+        writeAscii("--$boundary\r\n")
+        writeAscii("Content-Disposition: form-data; name=\"event\"\r\n")
+        writeAscii("Content-Type: application/json; charset=utf-8\r\n\r\n")
+        writeAscii(toWireJson(event, wireType).toString())
+        writeAscii("\r\n")
+        if (snapshot != null && snapshot.isFile) {
+            writeAscii("--$boundary\r\n")
+            writeAscii("Content-Disposition: form-data; name=\"snapshot\"; filename=\"${snapshot.name}\"\r\n")
+            writeAscii("Content-Type: image/jpeg\r\n\r\n")
+            snapshot.inputStream().use { it.copyTo(buffer) }
+            writeAscii("\r\n")
+        }
+        writeAscii("--$boundary--\r\n")
+        return buffer.toByteArray()
     }
 
     private fun toWireJson(event: PostureEvent, wireType: String): JSONObject = JSONObject().apply {
@@ -129,5 +146,30 @@ class PcSink(
     companion object {
         private const val TAG = "PcSink"
         const val HEADER_TOKEN = "X-Neck-Token"
+
+        /**
+         * 把网络异常翻译成用户看得懂、并且指向下一步动作的提示。
+         * 底层 message 附在后面，方便排查时对照日志。
+         */
+        fun humanize(raw: String): String {
+            val lower = raw.lowercase()
+            val hint = when {
+                lower.contains("econnrefused") || lower.contains("connection refused") ->
+                    "电脑拒绝了连接：地址多半填成了虚拟网卡（VMware / WSL / Hyper-V），或接收端没启动。建议点「扫描电脑」自动填"
+                lower.contains("etimedout") || lower.contains("timed out") || lower.contains("timeout") ->
+                    "连接超时：检查电脑防火墙是否放行，以及手机和电脑是否在同一个 Wi-Fi"
+                lower.contains("ehostunreach") || lower.contains("no route to host") ->
+                    "路由不可达：手机和电脑不在同一个局域网"
+                lower.contains("enetunreach") || lower.contains("network is unreachable") ->
+                    "网络不可达：手机可能没连上 Wi-Fi"
+                lower.contains("unable to resolve host") || lower.contains("unknownhost") ->
+                    "地址解析失败：请填 IP 而不是主机名"
+                lower.contains("http 401") -> "密钥不匹配：手机的共享密钥要和接收端 --token 一致"
+                lower.contains("http 404") -> "地址能连通但路径不对：只填到端口即可，不要带后面的路径"
+                lower.contains("cleartext") -> "系统拦截了明文 HTTP 请求"
+                else -> null
+            }
+            return if (hint == null) raw else "$hint（$raw）"
+        }
     }
 }

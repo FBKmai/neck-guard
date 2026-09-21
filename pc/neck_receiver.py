@@ -9,6 +9,11 @@
                      type 为 ALERT / CONFIRMED / RECOVERED / TEST
        字段 snapshot 可选 image/jpeg
        请求头 X-Neck-Token 可选，与 --token 一致才接受
+
+局域网发现（UDP，默认 8766）:
+  收 {"neckguard": "discover", "v": 1}          手机广播的探针
+  回 {"neckguard": "receiver", "name", "host", "port", "token_required", "v"}
+  host 用「路由探测」算出与手机同网段的本机 IP，避免手填到虚拟网卡地址。
 """
 from __future__ import annotations
 
@@ -46,6 +51,9 @@ APP_NAME = "颈椎卫士"
 VERSION = "1"
 MAX_BODY_BYTES = 20 * 1024 * 1024
 MAX_SNAPSHOTS = 200
+DISCOVERY_PORT = 8766
+DISCOVERY_MAGIC = "neckguard"
+FIREWALL_RULE_PREFIX = "NeckGuard Receiver"
 LOG = logging.getLogger("neck-receiver")
 
 
@@ -62,6 +70,8 @@ class Config:
         self.mute: bool = args.mute
         self.snapshot_dir: Path = Path(args.snapshot_dir).resolve()
         self.quiet_hours: Optional[Tuple[int, int]] = parse_quiet_hours(args.quiet_hours)
+        self.discovery_port: int = args.discovery_port
+        self.no_firewall: bool = args.no_firewall
 
 
 def parse_quiet_hours(text: Optional[str]) -> Optional[Tuple[int, int]]:
@@ -378,6 +388,187 @@ def make_handler(cfg: Config):
 
 
 # ----------------------------------------------------------------------------
+# 局域网自动发现（UDP 探针 -> 单播回应）
+# ----------------------------------------------------------------------------
+def route_ip_toward(peer_ip: str) -> Optional[str]:
+    """借内核选路算出与 peer 同网段、可达的本机 IP（connect UDP 不实际发包）。
+
+    这是自动发现的关键。本机常有多张网卡（VMware / VirtualBox / WSL / Hyper-V），
+    若回一个虚拟网卡地址，手机会连不上（表现为「连接被拒绝」）。
+    """
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((peer_ip, 9))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+
+class DiscoveryService(threading.Thread):
+    """监听 UDP 探针并单播回应本机接收端地址，与 App 的 PcDiscovery.kt 对应。"""
+
+    def __init__(self, cfg: Config, stop: threading.Event):
+        super().__init__(name="discovery", daemon=True)
+        self.cfg = cfg
+        self.stop_event = stop
+        self.sock: Optional[socket.socket] = None
+
+    def bind(self) -> bool:
+        """绑定 UDP 端口。失败只告警，不影响 HTTP 接收（手机仍可手填地址）。"""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", self.cfg.discovery_port))
+            s.settimeout(0.5)
+            self.sock = s
+            return True
+        except OSError as e:
+            LOG.warning("发现服务绑定 UDP %d 失败: %s（手机端需手填地址）", self.cfg.discovery_port, e)
+            return False
+
+    def run(self) -> None:
+        if self.sock is None:
+            return
+        hostname = socket.gethostname()
+        while not self.stop_event.is_set():
+            try:
+                data, addr = self.sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError as e:
+                if not self.stop_event.is_set():
+                    LOG.debug("发现服务接收异常: %s", e)
+                continue
+            try:
+                self._reply(data, addr, hostname)
+            except Exception as e:  # 单个坏包不能拖垮整个线程
+                LOG.debug("处理发现探针失败（来自 %s）: %s", addr, e)
+
+    def _reply(self, data: bytes, addr, hostname: str) -> None:
+        try:
+            probe = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return
+        if not isinstance(probe, dict) or probe.get(DISCOVERY_MAGIC) != "discover":
+            return
+        peer_ip = addr[0]
+        host = route_ip_toward(peer_ip) or self.cfg.host
+        if host in ("0.0.0.0", ""):
+            ips = local_ipv4_addresses()
+            host = ips[0] if ips else peer_ip
+        payload = {
+            DISCOVERY_MAGIC: "receiver",
+            "name": hostname,
+            "host": host,
+            "port": self.cfg.port,
+            "token_required": bool(self.cfg.token),
+            "v": 1,
+        }
+        if self.sock is not None:
+            self.sock.sendto(json.dumps(payload, ensure_ascii=False).encode("utf-8"), addr)
+        LOG.info("回应发现探针: %s -> http://%s:%d", peer_ip, host, self.cfg.port)
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+
+# ----------------------------------------------------------------------------
+# Windows 防火墙放行
+# ----------------------------------------------------------------------------
+def netsh_commands(cfg: Config) -> list:
+    """delete 再 add，保证重复执行或改端口后都能落到正确规则。"""
+    tcp = f"{FIREWALL_RULE_PREFIX} TCP"
+    udp = f"{FIREWALL_RULE_PREFIX} UDP"
+    return [
+        f'netsh advfirewall firewall delete rule name="{tcp}"',
+        f'netsh advfirewall firewall add rule name="{tcp}" dir=in action=allow protocol=TCP localport={cfg.port}',
+        f'netsh advfirewall firewall delete rule name="{udp}"',
+        f'netsh advfirewall firewall add rule name="{udp}" dir=in action=allow protocol=UDP localport={cfg.discovery_port}',
+    ]
+
+
+def is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def firewall_rules_present(cfg: Config) -> bool:
+    """规则存在且端口对得上才算放行，这样改了端口会自动重新放行。"""
+    script = (
+        f"$r = Get-NetFirewallRule -DisplayName '{FIREWALL_RULE_PREFIX}*' -ErrorAction SilentlyContinue;"
+        "if (-not $r) { exit 1 };"
+        '$p = ($r | Get-NetFirewallPortFilter | ForEach-Object { "$($_.Protocol):$($_.LocalPort)" }) -join \',\';'
+        "Write-Output $p"
+    )
+    try:
+        p = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True, timeout=25, text=True,
+        )
+    except Exception as e:
+        LOG.debug("查询防火墙规则失败: %s", e)
+        return False
+    if p.returncode != 0:
+        return False
+    out = (p.stdout or "").upper()
+    return f"TCP:{cfg.port}" in out and f"UDP:{cfg.discovery_port}" in out
+
+
+def ensure_firewall_rules(cfg: Config) -> str:
+    """确保 TCP(上报) 与 UDP(发现) 入站放行，返回给启动横幅用的状态文案。"""
+    if os.name != "nt":
+        return "非 Windows，跳过"
+    if cfg.no_firewall:
+        return "已按 --no-firewall 跳过"
+    try:
+        if firewall_rules_present(cfg):
+            return "已放行"
+    except Exception as e:
+        LOG.debug("防火墙检测异常: %s", e)
+
+    cmds = netsh_commands(cfg)
+    if is_admin():
+        ok = True
+        for c in cmds:
+            try:
+                r = subprocess.run(c, shell=True, capture_output=True, timeout=25)
+                # delete 在规则不存在时返回非 0 属正常，只校验 add
+                if " add " in c and r.returncode != 0:
+                    ok = False
+            except Exception as e:
+                LOG.warning("执行防火墙命令失败: %s", e)
+                ok = False
+        return "已自动添加" if ok else "添加失败，请手动执行下面的命令"
+
+    # 非管理员：弹一次 UAC，由提权进程落规则
+    joined = " & ".join(cmds)
+    try:
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", f'/c "{joined}"', None, 0)
+        if int(rc) > 32:
+            time.sleep(1.5)  # 给提权进程一点时间写入规则
+            if firewall_rules_present(cfg):
+                return "已自动添加（管理员）"
+            return "已请求管理员放行，若仍连不上请手动执行下面的命令"
+        return "提权被拒绝，请手动执行下面的命令"
+    except Exception as e:
+        LOG.debug("提权放行失败: %s", e)
+        return "无法自动放行，请手动执行下面的命令"
+
+
+# ----------------------------------------------------------------------------
 # 启动
 # ----------------------------------------------------------------------------
 def local_ipv4_addresses() -> list:
@@ -410,6 +601,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mute", action="store_true", help="不播放声音")
     p.add_argument("--snapshot-dir", default=str(Path(__file__).resolve().parent / "snapshots"), help="截图保存目录")
     p.add_argument("--quiet-hours", default="", help="静默时段，例如 23-7，该时段只记录不提醒")
+    p.add_argument("--discovery-port", type=int, default=DISCOVERY_PORT,
+                   help=f"局域网发现 UDP 端口，手机端「扫描电脑」用，默认 {DISCOVERY_PORT}")
+    p.add_argument("--no-firewall", action="store_true", help="不自动放行 Windows 防火墙")
+    p.add_argument("--firewall-only", action="store_true", help="只放行防火墙后退出，不启动服务")
     p.add_argument("--verbose", action="store_true", help="打印访问日志")
     return p
 
@@ -432,6 +627,14 @@ def main(argv=None) -> int:
         LOG.error("%s", e)
         return 2
 
+    if args.firewall_only:
+        status = ensure_firewall_rules(cfg)
+        print(f"防火墙放行: {status}")
+        if "手动" in status:
+            for c in netsh_commands(cfg):
+                print("    " + c)
+        return 0
+
     try:
         server = ThreadingHTTPServer((cfg.host, cfg.port), make_handler(cfg))
     except OSError as e:
@@ -439,13 +642,31 @@ def main(argv=None) -> int:
         return 1
     server.daemon_threads = True
 
+    firewall_status = ensure_firewall_rules(cfg)
+
+    stop = threading.Event()
+    discovery = DiscoveryService(cfg, stop)
+    discovery_ok = discovery.bind()
+
     ips = local_ipv4_addresses()
     print("=" * 60)
     print(f"{APP_NAME} 接收端已启动，监听 {cfg.host}:{cfg.port}")
+    if discovery_ok:
+        print(f"自动发现: 已开启（UDP {cfg.discovery_port}）")
+        print("  >> 手机 App 设置页点「扫描电脑」即可自动填地址，无需手动输入 <<")
+    else:
+        print(f"自动发现: 未启用（UDP {cfg.discovery_port} 绑定失败），请在手机端手填地址")
+    print(f"防火墙放行: {firewall_status}")
+    if "手动" in firewall_status:
+        print("  请以管理员身份执行：")
+        for c in netsh_commands(cfg):
+            print("    " + c)
     if ips:
-        print("请在手机设置页填写以下任一地址（选与手机同一 Wi-Fi 的那个）：")
+        print("手填地址（扫描失败时备用，多个地址时选与手机同一 Wi-Fi 的那个）：")
         for ip in ips:
             print(f"    http://{ip}:{cfg.port}")
+        if len(ips) > 1:
+            print("    注意：列出多个通常是虚拟网卡（VMware/WSL/Hyper-V），挑错会连接被拒绝，用「扫描电脑」最稳")
     else:
         print("未探测到局域网 IPv4 地址，请用 ipconfig 查看后填 http://<电脑IP>:%d" % cfg.port)
     print(f"共享密钥: {'已启用' if cfg.token else '未设置（任何设备都可上报）'}")
@@ -454,12 +675,8 @@ def main(argv=None) -> int:
     if cfg.quiet_hours:
         print(f"静默时段: {cfg.quiet_hours[0]:02d}:00 - {cfg.quiet_hours[1]:02d}:00")
     print(f"截图目录: {cfg.snapshot_dir}")
-    print("若手机「测试连接」失败，请以管理员身份放行防火墙端口：")
-    print(f'    netsh advfirewall firewall add rule name="NeckGuard {cfg.port}" dir=in action=allow protocol=TCP localport={cfg.port}')
     print("按 Ctrl+C 退出")
     print("=" * 60)
-
-    stop = threading.Event()
 
     def on_signal(signum, frame):
         stop.set()
@@ -472,12 +689,16 @@ def main(argv=None) -> int:
 
     t = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.5}, daemon=True)
     t.start()
+    if discovery_ok:
+        discovery.start()
     try:
         while not stop.is_set():
             time.sleep(0.3)
     except KeyboardInterrupt:
         pass
     LOG.info("正在退出")
+    stop.set()
+    discovery.close()
     server.shutdown()
     server.server_close()
     return 0

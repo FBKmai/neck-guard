@@ -180,7 +180,8 @@ stateDiagram-v2
 | `data/SettingsRepository.kt` | DataStore 持久化全部可调参数与基线 |
 | `data/EventLog.kt` | JSONL 追加写与读取最近 N 条，超 2000 行自动裁剪 |
 | `report/EventSink.kt` | 事件出口接口；v1 `LocalNotificationSink`，`CompositeSink` 支持多出口 |
-| `report/PcSink.kt` | 局域网电脑接收端出口：`GET /api/ping`、`POST /api/posture/events`（multipart，event JSON + snapshot JPEG，`X-Neck-Token` 头），5 s 连接 / 10 s 读超时，失败只记日志 |
+| `report/PcSink.kt` | 局域网电脑接收端出口：`GET /api/ping`、`POST /api/posture/events`（multipart，event JSON + snapshot JPEG，`X-Neck-Token` 头），5 s 连接 / 10 s 读超时，失败只记日志。body 先在内存拼好再按 `Content-Length` 发送，接收端不支持 chunked |
+| `report/PcDiscovery.kt` | 局域网接收端自动发现：向 UDP 8766 广播探针，接收端单播回带自己地址。回的 host 由接收端按手机所在网段算出，避免用户手填到虚拟网卡导致连接被拒绝 |
 | `ui/SetupScreen.kt` | 预览 + 叠加层 + 对齐状态 + 校准 + 开始监测 |
 | `ui/LivePreviewController.kt` | 摆放页的相机与推理生命周期、fps 统计、校准采样 |
 | `ui/PoseOverlay.kt` | Compose Canvas 画耳肩髋连线，处理 FIT_CENTER 与前置镜像 |

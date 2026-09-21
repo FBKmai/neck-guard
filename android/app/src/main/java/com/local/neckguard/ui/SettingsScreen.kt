@@ -1,5 +1,7 @@
 package com.local.neckguard.ui
 
+import android.content.Context
+import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -7,10 +9,13 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -42,6 +47,7 @@ import com.local.neckguard.data.EventLog
 import com.local.neckguard.data.EventType
 import com.local.neckguard.data.PostureEvent
 import com.local.neckguard.monitor.SnapshotStore
+import com.local.neckguard.report.PcDiscovery
 import com.local.neckguard.report.PcSink
 import com.local.neckguard.data.RecoveredNotify
 import com.local.neckguard.data.Settings
@@ -62,6 +68,9 @@ fun SettingsScreen(
     val settings by settingsRepo.settings.collectAsState(initial = Settings())
     var message by remember { mutableStateOf<String?>(null) }
     var diagnostics by remember { mutableStateOf<List<String>?>(null) }
+    // 扫描与两个测试按钮共用一个忙标记，避免连点并发导致结果互相覆盖
+    var pcBusy by remember { mutableStateOf(false) }
+    var discovered by remember { mutableStateOf<List<PcDiscovery.Receiver>?>(null) }
 
     fun save(transform: (Settings) -> Settings) {
         scope.launch {
@@ -232,7 +241,7 @@ fun SettingsScreen(
         )
         TextField(
             label = "电脑地址",
-            hint = "接收脚本启动时打印的地址，例如 http://192.168.1.23:8765",
+            hint = "点下面「扫描电脑」自动填；手填格式为 http://192.168.1.23:8765",
             stored = settings.pcEndpoint,
             keyboardType = KeyboardType.Uri,
             onSave = { v -> save { it.copy(pcEndpoint = v.trim()) } },
@@ -244,30 +253,67 @@ fun SettingsScreen(
             keyboardType = KeyboardType.Password,
             onSave = { v -> save { it.copy(pcToken = v.trim()) } },
         )
+        OutlinedButton(
+            onClick = {
+                if (pcBusy) return@OutlinedButton
+                pcBusy = true
+                message = "正在扫描局域网内的电脑"
+                scope.launch {
+                    val found = PcDiscovery.discover()
+                    pcBusy = false
+                    if (found.isEmpty()) {
+                        message = "没有扫描到电脑：确认接收端已启动、手机和电脑连同一个 Wi-Fi，" +
+                            "若路由器开启了 AP 隔离则需手填地址"
+                        toast(context, "没有扫描到电脑")
+                    } else {
+                        discovered = found
+                    }
+                }
+            },
+            enabled = !pcBusy,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            if (pcBusy) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+            }
+            Text(if (pcBusy) "扫描中" else "扫描电脑")
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(
                 onClick = {
                     val base = settings.pcBaseUrl
                     if (base == null) {
-                        message = "请先填写电脑地址"
+                        message = "请先填写电脑地址，或点「扫描电脑」自动填"
                     } else {
+                        pcBusy = true
                         message = "正在连接 $base"
                         scope.launch {
-                            message = when (val r = PcSink(base, settings.pcToken, "settings-test").ping()) {
-                                is PcSink.Result.Ok -> "连接成功: ${r.body.take(80)}"
-                                is PcSink.Result.Failed -> "连接失败: ${r.message}"
+                            val r = PcSink(base, settings.pcToken, "settings-test").ping()
+                            pcBusy = false
+                            when (r) {
+                                is PcSink.Result.Ok -> {
+                                    message = "连接成功（$base）"
+                                    toast(context, "连接成功")
+                                }
+                                is PcSink.Result.Failed -> {
+                                    message = "连接失败（$base）：" + PcSink.humanize(r.message)
+                                    toast(context, "连接失败")
+                                }
                             }
                         }
                     }
                 },
+                enabled = !pcBusy,
                 modifier = Modifier.weight(1f),
             ) { Text("测试连接") }
             OutlinedButton(
                 onClick = {
                     val base = settings.pcBaseUrl
                     if (base == null) {
-                        message = "请先填写电脑地址"
+                        message = "请先填写电脑地址，或点「扫描电脑」自动填"
                     } else {
+                        pcBusy = true
                         message = "正在发送测试事件"
                         scope.launch {
                             val event = PostureEvent(
@@ -278,14 +324,27 @@ fun SettingsScreen(
                                 thresholdDeg = 40f,
                                 message = "手机端测试事件",
                             )
-                            val snapshot = SnapshotStore(context).listFiles().firstOrNull()
-                            message = when (val r = PcSink(base, settings.pcToken, "settings-test").sendTest(event, snapshot)) {
-                                is PcSink.Result.Ok -> "发送成功，电脑应已弹出通知"
-                                is PcSink.Result.Failed -> "发送失败: ${r.message}"
+                            // 扫描快照目录是磁盘 IO，别放在主线程上
+                            val snapshot = withContext(Dispatchers.IO) {
+                                SnapshotStore(context).listFiles().firstOrNull()
+                            }
+                            val r = PcSink(base, settings.pcToken, "settings-test").sendTest(event, snapshot)
+                            pcBusy = false
+                            when (r) {
+                                is PcSink.Result.Ok -> {
+                                    message = "发送成功，电脑应已弹出通知" +
+                                        if (snapshot == null) "（本地还没有截图，这次只发了事件）" else ""
+                                    toast(context, "发送成功")
+                                }
+                                is PcSink.Result.Failed -> {
+                                    message = "发送失败（$base）：" + PcSink.humanize(r.message)
+                                    toast(context, "发送失败")
+                                }
                             }
                         }
                     }
                 },
+                enabled = !pcBusy,
                 modifier = Modifier.weight(1f),
             ) { Text("发送测试事件") }
         }
@@ -362,9 +421,57 @@ fun SettingsScreen(
             ) { Text("清空事件日志") }
         }
         message?.let {
-            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+            val failed = it.contains("失败") || it.contains("没有扫描到") || it.contains("请先填写")
+            Text(
+                it,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+            )
         }
         Spacer(Modifier.height(24.dp))
+    }
+
+    discovered?.let { list ->
+        AlertDialog(
+            onDismissRequest = { discovered = null },
+            confirmButton = { TextButton(onClick = { discovered = null }) { Text("取消") } },
+            title = { Text("扫描到 ${list.size} 台电脑") },
+            text = {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        "点一项即可填入地址。地址由电脑那侧按手机所在网段算出，不会填到虚拟网卡上。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    list.forEach { r ->
+                        OutlinedButton(
+                            onClick = {
+                                save { it.copy(pcEndpoint = r.baseUrl) }
+                                discovered = null
+                                message = if (r.tokenRequired && settings.pcToken.isBlank()) {
+                                    "已填入 ${r.baseUrl}，该电脑启用了密钥，请在「共享密钥」里填上再测试"
+                                } else {
+                                    "已填入 ${r.baseUrl}，可以点「测试连接」了"
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(r.name)
+                                Text(
+                                    r.baseUrl + if (r.tokenRequired) "（需要密钥）" else "",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+        )
     }
 
     diagnostics?.let { lines ->
@@ -391,6 +498,11 @@ fun SettingsScreen(
             },
         )
     }
+}
+
+/** 即时反馈，避免失败时页面上只剩一行不显眼的小字。 */
+private fun toast(context: Context, text: String) {
+    Toast.makeText(context, text, Toast.LENGTH_SHORT).show()
 }
 
 /** 一排单选芯片，用于镜头、分辨率这类少量互斥选项。 */

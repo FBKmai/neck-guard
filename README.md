@@ -22,8 +22,13 @@
 │       ├── camera/               镜头解析（含超广角）、use case 构建
 │       ├── monitor/              前台服务、状态总线、快照、通知
 │       ├── data/                 DataStore 设置、JSONL 事件日志
-│       ├── report/               事件出口接口（v1 本机通知，v2 预留服务器上报）
+│       ├── report/               事件出口：本机通知、局域网上报（PcSink）、自动发现（PcDiscovery）
 │       └── ui/                   摆放/校准、监测、设置三个页面
+├── pc/                           电脑接收端（Python），弹 Windows 通知并响铃
+│   ├── neck_receiver.py          HTTP 接收 + UDP 自动发现 + 防火墙放行
+│   ├── run_receiver.bat          双击启动
+│   ├── send_test_event.py        本机自测：发一条 TEST 事件
+│   └── test_discovery.py         本机自测：模拟手机端扫描
 └── tools/                        PC 原型（Python），用于调阈值，也是树莓派版本的算法基础
     ├── requirements.txt
     ├── posture_geometry.py       与 Kotlin 端完全一致的算法实现
@@ -131,9 +136,12 @@ python posture_probe.py --camera 0
 
 手机和电脑在同一 Wi-Fi 下，可把前倾事件与截图同步发到电脑，由电脑弹 Windows 通知并响铃：
 
-1. 电脑上运行 `pc/run_receiver.bat`（或 `python pc/neck_receiver.py --token 你的密钥`），记下打印出的地址，例如 `http://192.168.1.23:8765`。
-2. 手机 App「设置」页的「电脑接收端」区块：填地址与密钥，打开「上报到电脑」，点「测试连接」与「发送测试事件」确认。
-3. 之后每次前倾提醒都会同时发到电脑。详细参数、防火墙放行与接口说明见 `pc/README.md`。
+1. 电脑上运行 `pc/run_receiver.bat`（或 `python pc/neck_receiver.py --token 你的密钥`）。首次启动会弹一次 UAC 自动放行防火墙，允许即可。
+2. 手机 App「设置」页的「电脑接收端」区块：点「扫描电脑」，选中这台电脑，地址会自动填好。
+3. 填上与 `--token` 一致的共享密钥，打开「上报到电脑」，点「测试连接」与「发送测试事件」确认。
+4. 之后每次前倾提醒都会同时发到电脑。详细参数、发现协议与接口说明见 `pc/README.md`。
+
+之所以用扫描而不是手填：电脑上常有 VMware、WSL、Hyper-V 装的虚拟网卡，`ipconfig` 会列出好几个 IP，手填挑错就会「连接被拒绝」。扫描时地址由电脑按手机所在网段算出，不会填错。
 
 ## 监测页的事件记录
 
