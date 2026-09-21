@@ -25,22 +25,26 @@ class AlertNotifier(private val context: Context) {
         Build.VERSION.SDK_INT < 33 ||
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 
-    fun buildStatusNotification(text: String): Notification =
+    /** @param streaming 无线相机模式，标题与动作文案都换成「推流」。 */
+    fun buildStatusNotification(text: String, streaming: Boolean = false): Notification =
         NotificationCompat.Builder(context, NeckGuardApp.CHANNEL_STATUS)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(context.getString(R.string.notif_status_title))
+            .setContentTitle(
+                if (streaming) "颈椎卫士正在推流到电脑" else context.getString(R.string.notif_status_title),
+            )
             .setContentText(text)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setSilent(true)
             .setContentIntent(openAppIntent(MainActivity.EXTRA_SCREEN_MONITOR))
-            .addAction(0, "停止监测", stopServiceIntent())
+            .addAction(0, if (streaming) "停止推流" else "停止监测", stopServiceIntent())
             .build()
 
-    fun updateStatus(text: String) {
+    fun updateStatus(text: String, streaming: Boolean = false) {
         if (!canPost()) return
         try {
-            NotificationManagerCompat.from(context).notify(STATUS_ID, buildStatusNotification(text))
+            NotificationManagerCompat.from(context)
+                .notify(STATUS_ID, buildStatusNotification(text, streaming))
         } catch (e: SecurityException) {
             Log.w(TAG, "notify status denied", e)
         }

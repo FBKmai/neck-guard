@@ -495,7 +495,8 @@ fun SettingsScreen(
         HorizontalDivider()
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(
-                // 基线、镜头与电脑接收端配置是用户一次性设好的，不该被"恢复默认"清掉
+                // 基线、镜头、检测方式与两处电脑配置都是用户一次性设好的，
+                // 只恢复调参项，不该被"恢复默认"一把清掉
                 onClick = {
                     save {
                         Settings(
@@ -504,6 +505,10 @@ fun SettingsScreen(
                             pcEndpoint = it.pcEndpoint,
                             pcToken = it.pcToken,
                             pcEnabled = it.pcEnabled,
+                            detectionMode = it.detectionMode,
+                            streamPort = it.streamPort,
+                            streamDiscoveryPort = it.streamDiscoveryPort,
+                            streamToken = it.streamToken,
                         )
                     }
                 },

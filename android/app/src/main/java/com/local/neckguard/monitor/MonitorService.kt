@@ -352,7 +352,7 @@ class MonitorService : LifecycleService() {
                         streamBytesSent = server?.totalBytesSent ?: 0L,
                     )
                 }
-                notifier.updateStatus(streamStatusText(fps))
+                notifier.updateStatus(streamStatusText(fps), streaming = true)
                 lastStatusAt = now
             }
         }
@@ -904,7 +904,7 @@ class MonitorService : LifecycleService() {
         Log.w(TAG, message)
         MonitorBus.update { it.copy(lastError = message) }
         eventLog.append(PostureEvent(System.currentTimeMillis(), type, message = message))
-        notifier.updateStatus("异常: $message")
+        notifier.updateStatus("异常: $message", streaming = streaming)
     }
 
     private suspend fun fail(message: String) {
