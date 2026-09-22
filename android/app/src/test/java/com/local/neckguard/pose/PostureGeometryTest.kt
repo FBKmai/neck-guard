@@ -302,6 +302,39 @@ class PostureGeometryTest {
     }
 
     @Test
+    fun referenceDirection_matchesTheAngleBasis() {
+        // 叠加层按 referenceDirection 画参考线，它必须和算角度用的方向一致
+        val memory = SideAndTorsoMemory()
+        val withHip = sideView(earX = 0.64f, earY = 0.30f, shoulderX = 0.50f, shoulderY = 0.50f, hipX = 0.36f, hipY = 0.82f)
+        val first = (memory.analyze(withHip, 100, 100, 0L) as FrameResult.Valid).measurement
+        val hip = first.hip!!
+        val dx = first.shoulder.x - hip.x
+        val dy = first.shoulder.y - hip.y
+        val len = kotlin.math.hypot(dx, dy)
+        val dir = first.referenceDirection!!
+        assertEquals(dx / len, dir.x, 1e-5f)
+        assertEquals(dy / len, dir.y, 1e-5f)
+        // 用它反算角度，应与 measurement 里的角度一致
+        val recomputed = PostureGeometry.angleBetweenVectors(
+            dir.x, dir.y, first.ear.x - first.shoulder.x, first.ear.y - first.shoulder.y,
+        )
+        assertEquals(first.neckInclinationDeg, recomputed, 1e-3f)
+
+        // 髋丢失沿用时，方向不变，参考线不会突然跳成竖直
+        val noHip = sideView(earX = 0.64f, earY = 0.30f, shoulderX = 0.50f, shoulderY = 0.50f, hipX = null, hipY = null)
+        val held = (memory.analyze(noHip, 100, 100, 500L) as FrameResult.Valid).measurement
+        assertEquals(NeckReference.TORSO_HELD, held.neckReference)
+        assertEquals(null, held.hip)
+        assertEquals(dir.x, held.referenceDirection!!.x, 1e-5f)
+        assertEquals(dir.y, held.referenceDirection!!.y, 1e-5f)
+
+        // 退回竖直参考时为 null，由调用方画竖直线
+        val expired = memory.analyze(noHip, 100, 100, 5_000L).measurementOrNull!!
+        assertEquals(NeckReference.VERTICAL, expired.neckReference)
+        assertEquals(null, expired.referenceDirection)
+    }
+
+    @Test
     fun torsoHint_disabledByZeroHold() {
         val memory = SideAndTorsoMemory(GeometryConfig(torsoHoldMillis = 0L))
         val withHip = sideView(earX = 0.6f, earY = 0.35f, shoulderX = 0.5f, shoulderY = 0.5f, hipX = 0.5f, hipY = 0.8f)

@@ -7,7 +7,6 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.util.Log
-import com.local.neckguard.pose.NeckReference
 import com.local.neckguard.pose.PostureMeasurement
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -80,23 +79,18 @@ class SnapshotStore(context: Context) {
         if (m != null) {
             m.hip?.let { canvas.drawLine(it.x, it.y, m.shoulder.x, m.shoulder.y, line) }
             canvas.drawLine(m.shoulder.x, m.shoulder.y, m.ear.x, m.ear.y, line)
-            // 参考线：颈角以它为基准。有髋就沿躯干延长，否则退回竖直。
+            // 参考线：颈角以它为基准
             val ref = Paint(line).apply { color = Color.argb(160, 255, 255, 255); strokeWidth = stroke / 2 }
             val neckLen = hypot(m.ear.x - m.shoulder.x, m.ear.y - m.shoulder.y).coerceAtLeast(stroke * 4)
-            val hip = m.hip
-            if (m.neckReference == NeckReference.TORSO && hip != null) {
-                val dx = m.shoulder.x - hip.x
-                val dy = m.shoulder.y - hip.y
-                val len = hypot(dx, dy)
-                if (len < 1e-3f) {
-                    canvas.drawLine(m.shoulder.x, m.shoulder.y, m.shoulder.x, m.shoulder.y - neckLen, ref)
-                } else {
-                    canvas.drawLine(
-                        m.shoulder.x, m.shoulder.y,
-                        m.shoulder.x + dx / len * neckLen * 1.2f, m.shoulder.y + dy / len * neckLen * 1.2f,
-                        ref,
-                    )
-                }
+            // 方向直接取自 measurement，保证线与角度同源：髋短暂丢失时角度按沿用的
+            // 躯干方向算（TORSO_HELD），线也要跟着画，否则截图上线与数字对不上。
+            val dir = m.referenceDirection
+            if (dir != null) {
+                canvas.drawLine(
+                    m.shoulder.x, m.shoulder.y,
+                    m.shoulder.x + dir.x * neckLen * 1.2f, m.shoulder.y + dir.y * neckLen * 1.2f,
+                    ref,
+                )
             } else {
                 canvas.drawLine(m.shoulder.x, m.shoulder.y, m.shoulder.x, m.shoulder.y - neckLen, ref)
             }

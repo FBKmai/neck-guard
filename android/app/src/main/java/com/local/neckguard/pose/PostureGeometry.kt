@@ -69,6 +69,13 @@ data class PostureMeasurement(
     val aligned: Boolean,
     /** [neckInclinationDeg] 用的参考方向。 */
     val neckReference: NeckReference = NeckReference.TORSO,
+    /**
+     * 实际用来算角度的参考方向（已单位化，由髋指向肩）。
+     * [NeckReference.TORSO_HELD] 时髋为 null，但角度是按这条沿用的方向算的，
+     * 叠加层要用它画参考线，否则线是竖直的而数字不是，看着对不上。
+     * VERTICAL 时为 null（参考线就是竖直向上）。
+     */
+    val referenceDirection: PixelPoint? = null,
 )
 
 sealed class FrameResult {
@@ -280,6 +287,17 @@ object PostureGeometry {
             )
             else -> inclinationFromVertical(shoulder, ear)
         }
+        // 叠加层按它画参考线，保证线与角度始终同源
+        val referenceDirection = when {
+            hip != null -> {
+                val dx = shoulder.x - hip.x
+                val dy = shoulder.y - hip.y
+                val len = hypot(dx, dy)
+                if (len < 1e-4f) null else PixelPoint(dx / len, dy / len)
+            }
+            useHint -> PixelPoint(torsoHint!!.dx, torsoHint.dy)
+            else -> null
+        }
 
         val torsoLen = if (hipVisible != null) distance(shoulder, hipVisible) else neckLen * 2f
         val offsetRatio = if (farShoulderLm.visibility < config.minVisibility || torsoLen < 1e-3f) {
@@ -300,6 +318,7 @@ object PostureGeometry {
             shoulderOffsetRatio = offsetRatio,
             aligned = aligned,
             neckReference = reference,
+            referenceDirection = referenceDirection,
         )
         return when {
             // 对齐问题优先提示：摆放不对时算出来的角度本来也不可信

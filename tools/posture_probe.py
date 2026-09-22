@@ -129,15 +129,13 @@ def draw_overlay(bgr: np.ndarray, status: str, m: Optional[pg.Measurement],
             return int(round(p[0])), int(round(p[1]))
 
         ear, sh = ip(m.ear), ip(m.shoulder)
-        # 参考线：颈角以它为基准。有躯干线就沿它延长，否则退回竖直。
+        # 参考线：方向直接取自 measurement，保证线与角度同源。髋短暂丢失时角度按
+        # 沿用的躯干方向算（REF_TORSO_HELD），线也要跟着画，否则看着对不上。
         neck_len = max(float(stroke * 6), math.hypot(ear[0] - sh[0], ear[1] - sh[1]))
-        if m.neck_reference == pg.REF_TORSO and m.hip is not None:
-            dx, dy = sh[0] - m.hip[0], sh[1] - m.hip[1]
-            length = math.hypot(dx, dy)
-            if length < 1e-3:
-                ref_end = (sh[0], int(sh[1] - neck_len))
-            else:
-                ref_end = (int(sh[0] + dx / length * neck_len * 1.2), int(sh[1] + dy / length * neck_len * 1.2))
+        ref_dir = m.reference_direction
+        if ref_dir is not None:
+            ref_end = (int(sh[0] + ref_dir[0] * neck_len * 1.2),
+                       int(sh[1] + ref_dir[1] * neck_len * 1.2))
         else:
             ref_end = (sh[0], int(sh[1] - neck_len))
         cv2.line(out, sh, ref_end, (255, 255, 255), max(1, stroke // 2), cv2.LINE_AA)

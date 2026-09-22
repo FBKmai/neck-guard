@@ -7,7 +7,6 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import com.local.neckguard.pose.FrameResult
-import com.local.neckguard.pose.NeckReference
 import com.local.neckguard.pose.PostureMeasurement
 import kotlin.math.hypot
 
@@ -56,11 +55,16 @@ fun PoseOverlay(
         val shoulder = map(m.shoulder.x, m.shoulder.y)
         val hip = m.hip?.let { map(it.x, it.y) }
 
-        // 参考线：颈角以它为基准。有髋就沿躯干延长，否则退回竖直。
+        // 参考线：颈角以它为基准，方向直接取自 measurement，保证线与角度同源。
+        // 髋短暂丢失时角度按沿用的躯干方向算（TORSO_HELD），这里也必须跟着画，
+        // 否则线是竖直的而数字不是，看起来对不上。
         val neckLen = hypot(ear.x - shoulder.x, ear.y - shoulder.y).coerceAtLeast(stroke * 4)
-        val refEnd = if (m.neckReference == NeckReference.TORSO && hip != null) {
-            val dx = shoulder.x - hip.x
-            val dy = shoulder.y - hip.y
+        val dir = m.referenceDirection
+        val refEnd = if (dir != null) {
+            // 方向是图像坐标下的单位向量，映射到画布时要跟着缩放与镜像走
+            val tip = map(m.shoulder.x + dir.x * 100f, m.shoulder.y + dir.y * 100f)
+            val dx = tip.x - shoulder.x
+            val dy = tip.y - shoulder.y
             val len = hypot(dx, dy)
             if (len < 1e-3f) {
                 Offset(shoulder.x, shoulder.y - neckLen)

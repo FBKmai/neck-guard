@@ -226,6 +226,35 @@ class GeometryTest(unittest.TestCase):
         self.assertEqual(bare.neck_reference, REF_VERTICAL)
         self.assertGreater(bare.neck_deg - m1.neck_deg, 20.0)
 
+    def test_reference_direction_matches_the_angle_basis(self):
+        """叠加层按 reference_direction 画参考线，它必须和算角度用的方向一致。"""
+        mem = pg.SideAndTorsoMemory()
+        with_hip = side_view(0.64, 0.30, 0.50, 0.50, hip_x=0.36, hip_y=0.82)
+        _, m1 = mem.analyze(with_hip, 100, 100, now_ms=0)
+        # 有髋时就是单位化的髋->肩方向
+        dx, dy = m1.shoulder[0] - m1.hip[0], m1.shoulder[1] - m1.hip[1]
+        length = math.hypot(dx, dy)
+        self.assertAlmostEqual(m1.reference_direction[0], dx / length, places=5)
+        self.assertAlmostEqual(m1.reference_direction[1], dy / length, places=5)
+        # 用它反算角度，应与 measurement 里的角度一致
+        recomputed = pg.angle_between_vectors(
+            m1.reference_direction[0], m1.reference_direction[1],
+            m1.ear[0] - m1.shoulder[0], m1.ear[1] - m1.shoulder[1])
+        self.assertAlmostEqual(recomputed, m1.neck_deg, places=3)
+
+        # 髋丢失沿用时，方向不变，参考线不会突然跳成竖直
+        no_hip = side_view(0.64, 0.30, 0.50, 0.50, hip_x=None, hip_y=None)
+        _, m2 = mem.analyze(no_hip, 100, 100, now_ms=500)
+        self.assertEqual(m2.neck_reference, pg.REF_TORSO_HELD)
+        self.assertIsNone(m2.hip)
+        self.assertAlmostEqual(m2.reference_direction[0], m1.reference_direction[0], places=5)
+        self.assertAlmostEqual(m2.reference_direction[1], m1.reference_direction[1], places=5)
+
+        # 退回竖直参考时为 None，由调用方画竖直线
+        _, m3 = mem.analyze(no_hip, 100, 100, now_ms=5_000)
+        self.assertEqual(m3.neck_reference, REF_VERTICAL)
+        self.assertIsNone(m3.reference_direction)
+
     def test_torso_hint_disabled_by_zero_hold(self):
         cfg = GeometryConfig(torso_hold_millis=0)
         mem = pg.SideAndTorsoMemory(cfg)

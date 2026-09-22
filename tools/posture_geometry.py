@@ -60,6 +60,10 @@ class Measurement:
     shoulder_offset_ratio: float
     aligned: bool
     neck_reference: str = REF_TORSO
+    #: 实际用来算角度的参考方向（已单位化，由髋指向肩）。
+    #: REF_TORSO_HELD 时髋为 None，但角度是按这条沿用的方向算的，叠加层要用它
+    #: 画参考线，否则线是竖直的而数字不是，看着对不上。REF_VERTICAL 时为 None。
+    reference_direction: Optional[Point] = None
 
 
 @dataclass
@@ -245,6 +249,16 @@ def analyze(lms: Optional[Sequence[Landmark]], width: int, height: int,
         reference = REF_VERTICAL
         neck = inclination_from_vertical(shoulder, ear)
 
+    # 叠加层按它画参考线，保证线与角度始终同源
+    ref_dir: Optional[Point] = None
+    if hip is not None:
+        dx, dy = shoulder[0] - hip[0], shoulder[1] - hip[1]
+        length = math.hypot(dx, dy)
+        if length >= 1e-4:
+            ref_dir = (dx / length, dy / length)
+    elif reference == REF_TORSO_HELD:
+        ref_dir = (torso_hint.dx, torso_hint.dy)
+
     torso_len = distance(shoulder, hip_visible) if hip_visible is not None else neck_len * 2.0
     if far_lm.visibility < cfg.min_visibility or torso_len < 1e-3:
         # 远侧肩膀被身体挡住，恰好说明是正侧面
@@ -253,7 +267,7 @@ def analyze(lms: Optional[Sequence[Landmark]], width: int, height: int,
         offset = abs(px(far_lm)[0] - shoulder[0]) / max(torso_len, 1e-3)
     aligned = offset < cfg.max_shoulder_offset_ratio
 
-    m = Measurement(side, ear, shoulder, hip_visible, neck, torso, offset, aligned, reference)
+    m = Measurement(side, ear, shoulder, hip_visible, neck, torso, offset, aligned, reference, ref_dir)
     # 对齐问题优先提示：摆放不对时算出来的角度本来也不可信
     if not aligned:
         return MISALIGNED, m
