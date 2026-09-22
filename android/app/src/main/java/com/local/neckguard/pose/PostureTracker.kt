@@ -27,9 +27,12 @@ enum class ModeChangeReason {
 /**
  * 双速状态机参数。时间单位毫秒。
  *
- * 巡检期以 slowIntervalMillis 送帧，只做逐帧计数不进窗聚合；
- * 一旦连续 triggerFrames 个有效帧超阈值就切到 fastIntervalMillis，
+ * 巡检期以 slowIntervalMillis 送帧，只做逐帧计时不进窗聚合；
+ * 一旦超阈值持续 triggerMillis 就切到 fastIntervalMillis，
  * 用 confirmWindowMillis 的窗复用 PostureAnalyzer 的中位数 + 迟滞 + 连续窗判定。
+ *
+ * v0.7 起触发与恢复一律按时长而不是帧数：手机巡检 1.4 fps、电脑拉流 30 fps，
+ * 同样的「连续 2 帧」在两端相差 7 倍，按毫秒才能让两端行为真正一致。
  */
 data class TrackerConfig(
     /** 巡检模式最小送帧间隔，默认 700 ms（约 1.4 fps）。 */
@@ -38,10 +41,12 @@ data class TrackerConfig(
     val fastIntervalMillis: Long = 125L,
     /** 一个确认窗的时长。 */
     val confirmWindowMillis: Long = 3_000L,
-    /** 巡检下连续多少个有效帧超过阈值才进入确认模式。 */
-    val triggerFrames: Int = 2,
-    /** 前倾中连续多少个有效帧低于退出线才算恢复。 */
-    val recoverFrames: Int = 5,
+    /** 巡检下超过阈值持续这么久才进入确认模式。 */
+    val triggerMillis: Long = 1_400L,
+    /** 前倾中低于退出线持续这么久才算恢复。 */
+    val recoverMillis: Long = 3_500L,
+    /** 计时途中出现无效帧，容忍这么久不清零；超过则本次计时作废。 */
+    val invalidGraceMillis: Long = 1_000L,
     /** 确认后至少隔这么久才允许再次进入确认（还需通知冷却也已过）。 */
     val retriggerHoldMillis: Long = 30_000L,
     /** 确认模式内连续多少个无效窗就退回巡检。 */
@@ -52,11 +57,16 @@ data class TrackerConfig(
         slowIntervalMillis = slowIntervalMillis.coerceIn(MIN_INTERVAL_MILLIS, 10_000L),
         fastIntervalMillis = fastIntervalMillis.coerceIn(MIN_INTERVAL_MILLIS, 5_000L),
         confirmWindowMillis = confirmWindowMillis.coerceIn(500L, 60_000L),
-        triggerFrames = triggerFrames.coerceAtLeast(1),
-        recoverFrames = recoverFrames.coerceAtLeast(1),
+        triggerMillis = triggerMillis.coerceAtLeast(0L),
+        recoverMillis = recoverMillis.coerceAtLeast(0L),
+        invalidGraceMillis = invalidGraceMillis.coerceAtLeast(0L),
         retriggerHoldMillis = retriggerHoldMillis.coerceAtLeast(0L),
         maxInvalidWindows = maxInvalidWindows.coerceAtLeast(1),
     )
+
+    /** 确认窗内按送帧间隔推算的期望帧数，用于窗有效性门槛。 */
+    fun expectedFramesPerWindow(): Int =
+        (confirmWindowMillis / fastIntervalMillis.coerceAtLeast(1L)).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
 
     companion object {
         const val MIN_INTERVAL_MILLIS = 30L
@@ -94,8 +104,9 @@ data class TrackerSnapshot(
     val mode: TrackerMode,
     val forwardHead: Boolean,
     val badStreak: Int,
-    val triggerProgress: Int,
-    val recoverProgress: Int,
+    /** 已累计的超阈值 / 低于退出线时长，毫秒。 */
+    val triggerProgressMillis: Long,
+    val recoverProgressMillis: Long,
     val windowSeq: Long,
     val windowStartedAtMillis: Long?,
     val windowValidFrames: Int,
@@ -136,8 +147,16 @@ class PostureTracker(
     var mode: TrackerMode = TrackerMode.SLOW
         private set
 
-    private var triggerCount = 0
-    private var recoverCount = 0
+    /** 超阈值 / 低于退出线的连续计时起点，null 表示没在计时。 */
+    private var triggerSince: Long? = null
+    private var recoverSince: Long? = null
+
+    /** 计时期间最后一次满足条件的帧时刻，用来算已累计时长。 */
+    private var lastTriggerAt: Long? = null
+    private var lastRecoverAt: Long? = null
+
+    /** 计时中途第一个无效帧的时刻，用于宽限期。 */
+    private var invalidSince: Long? = null
     private var consecutiveInvalid = 0
     private var windowSeq = 0L
     private var windowStartedAt: Long? = null
@@ -208,8 +227,8 @@ class PostureTracker(
             mode = mode,
             forwardHead = analyzer.inForwardHead,
             badStreak = analyzer.badStreak,
-            triggerProgress = triggerCount,
-            recoverProgress = recoverCount,
+            triggerProgressMillis = elapsed(triggerSince, lastTriggerAt),
+            recoverProgressMillis = elapsed(recoverSince, lastRecoverAt),
             windowSeq = windowSeq,
             windowStartedAtMillis = windowStartedAt,
             windowValidFrames = if (mode == TrackerMode.FAST) progress.first else 0,
@@ -225,11 +244,31 @@ class PostureTracker(
     private fun resetInternal() {
         mode = TrackerMode.SLOW
         desiredIntervalMillis = config.slowIntervalMillis
-        triggerCount = 0
-        recoverCount = 0
+        clearTimers()
         consecutiveInvalid = 0
         windowStartedAt = null
         confirmedAt = null
+    }
+
+    private fun clearTimers() {
+        triggerSince = null
+        recoverSince = null
+        lastTriggerAt = null
+        lastRecoverAt = null
+        invalidSince = null
+    }
+
+    /** 计时起点到最后一次满足条件的帧之间的时长。没在计时返回 0。 */
+    private fun elapsed(since: Long?, last: Long?): Long {
+        if (since == null || last == null) return 0L
+        return (last - since).coerceAtLeast(0L)
+    }
+
+    /** 条件是否已连续满足 needMillis。needMillis <= 0 时一帧即成立。 */
+    private fun heldFor(since: Long?, last: Long?, needMillis: Long): Boolean {
+        if (since == null) return false
+        if (needMillis <= 0L) return true
+        return elapsed(since, last) >= needMillis
     }
 
     private fun intervalFor(m: TrackerMode): Long =
@@ -240,58 +279,78 @@ class PostureTracker(
         return nowMillis - started >= config.confirmWindowMillis
     }
 
-    /** 巡检帧：只逐帧计数，不进窗聚合。 */
+    /**
+     * 巡检帧：按时长累计，不进窗聚合。
+     *
+     * v0.7 起触发与恢复都按毫秒计时，换帧率不会改变行为。
+     * 短暂无效（抓一下脸、手挡住耳朵）在宽限期内只挂起计时而不清零，
+     * 否则 1.4 fps 的巡检下摸一次脸就要从头再来。
+     */
     private fun handleSlowFrame(result: FrameResult, nowMillis: Long, events: MutableList<TrackerEvent>) {
         val measurement = (result as? FrameResult.Valid)?.measurement
         if (measurement == null) {
-            // 未对齐 / 看不清 / 没人：两个方向的连续计数都清零，避免跨越无效段累计
-            triggerCount = 0
-            recoverCount = 0
+            // 未对齐 / 无躯干线 / 看不清 / 没人
+            if (triggerSince == null && recoverSince == null) return
+            val since = invalidSince
+            if (since == null) {
+                invalidSince = nowMillis
+            } else if (nowMillis - since >= config.invalidGraceMillis) {
+                clearTimers()
+            }
             return
         }
+        invalidSince = null
         val neck = measurement.neckInclinationDeg
         if (!analyzer.inForwardHead) {
             // S0：正常巡检
-            recoverCount = 0
+            recoverSince = null
+            lastRecoverAt = null
             if (neck > analyzer.thresholdDeg) {
-                triggerCount++
-                if (triggerCount >= config.triggerFrames) {
+                if (triggerSince == null) triggerSince = nowMillis
+                lastTriggerAt = nowMillis
+                if (heldFor(triggerSince, lastTriggerAt, config.triggerMillis)) {
                     enterFast(ModeChangeReason.TRIGGERED, neck, nowMillis, events)
                 }
             } else {
-                triggerCount = 0
+                triggerSince = null
+                lastTriggerAt = null
             }
             return
         }
         // S2：已确认前倾，等恢复或冷却后重新确认
         if (neck < analyzer.exitThresholdDeg) {
-            triggerCount = 0
-            recoverCount++
-            if (recoverCount >= config.recoverFrames) {
+            triggerSince = null
+            lastTriggerAt = null
+            if (recoverSince == null) recoverSince = nowMillis
+            lastRecoverAt = nowMillis
+            if (heldFor(recoverSince, lastRecoverAt, config.recoverMillis)) {
                 analyzer.markRecovered()
                 // 只有确认过（用户已经收到提醒）才报恢复，否则"已恢复"会来得莫名其妙
                 confirmedAt?.let { events.add(TrackerEvent.Recovered(neck, nowMillis - it)) }
-                recoverCount = 0
+                recoverSince = null
+                lastRecoverAt = null
                 confirmedAt = null
             }
             return
         }
-        recoverCount = 0
+        recoverSince = null
+        lastRecoverAt = null
         val holdPassed = confirmedAt?.let { nowMillis - it >= config.retriggerHoldMillis } ?: true
         if (holdPassed && analyzer.canNotify(nowMillis)) {
-            triggerCount++
-            if (triggerCount >= config.triggerFrames) {
+            if (triggerSince == null) triggerSince = nowMillis
+            lastTriggerAt = nowMillis
+            if (heldFor(triggerSince, lastTriggerAt, config.triggerMillis)) {
                 enterFast(ModeChangeReason.RETRIGGERED, neck, nowMillis, events)
             }
         } else {
             // 迟滞带内或冷却未过：保持前倾状态但不做无谓的高帧率确认
-            triggerCount = 0
+            triggerSince = null
+            lastTriggerAt = null
         }
     }
 
     private fun enterFast(reason: ModeChangeReason, neckDeg: Float?, nowMillis: Long, events: MutableList<TrackerEvent>) {
-        triggerCount = 0
-        recoverCount = 0
+        clearTimers()
         consecutiveInvalid = 0
         beginWindow(nowMillis)
         mode = TrackerMode.FAST
@@ -303,15 +362,15 @@ class PostureTracker(
         windowStartedAt = null
         mode = TrackerMode.SLOW
         desiredIntervalMillis = config.slowIntervalMillis
-        triggerCount = 0
-        recoverCount = 0
+        clearTimers()
         events.add(TrackerEvent.ModeChanged(TrackerMode.FAST, TrackerMode.SLOW, reason, neckDeg))
     }
 
     private fun beginWindow(nowMillis: Long) {
         windowSeq++
         windowStartedAt = nowMillis
-        analyzer.beginWindow()
+        // 把期望帧数交给分析器，窗有效性按覆盖率而非绝对帧数判定
+        analyzer.beginWindow(config.expectedFramesPerWindow())
     }
 
     private fun endWindowInto(events: MutableList<TrackerEvent>, nowMillis: Long) {

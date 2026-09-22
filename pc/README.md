@@ -203,7 +203,7 @@ python neck_camera_monitor.py --url http://192.168.1.20:8767/video --show
 
 `--show` 会开一个预览窗，能看到实时的耳肩髋连线和角度，并支持快捷键：
 
-- `c` 校准：保持端正坐姿 3 秒，取中位数做个人基线，存进 `camera_monitor.json` 下次自动带上
+- `c` 校准：保持端正坐姿 3 秒，取中位数做个人基线，按「后端 + 模型」存进 `camera_monitor.json`，下次用同一组合时自动带上
 - `r` 清除校准，回到绝对阈值
 - `q` 退出
 
@@ -222,12 +222,26 @@ python neck_camera_monitor.py --url http://192.168.1.20:8767/video --show
 | `--device` | `cuda:0` 或 `cpu` | 自动 |
 | `--threshold` | 未校准时的绝对阈值（度） | 35 |
 | `--window-sec` / `--consecutive-windows` | 确认窗时长与连续窗数 | 3 / 2 |
+| `--trigger-sec` | 超过阈值持续多久进入确认 | 1.4 |
+| `--recover-sec` | 低于退出线持续多久算恢复 | 3.5 |
+| `--invalid-grace-sec` | 计时途中看不清的容忍时长 | 1.0 |
+| `--min-valid-ratio` | 确认窗内有效帧至少要占期望帧数的多少 | 1/3 |
 | `--cooldown-min` | 两次响铃之间的最小间隔（分钟） | 10 |
 | `--allow-no-hip` | 髋不可见时退回竖直参考继续判定 | 关 |
+| `--torso-hold-sec` | 髋丢失后沿用上次躯干方向多少秒，0 关闭 | 2 |
+| `--kpt-conf` | YOLO 关键点可信下限 | 0.5 |
+| `--mp-visibility` | MediaPipe 关键点 visibility 下限 | 0.5 |
 | `--quiet-hours 23-7` | 静默时段，只记录不提醒 | 无 |
 | `--mute` / `--beep` | 静音 / 用蜂鸣代替提示音 | 关 |
 
 模型按显存自动选：16 GB 以上用 `yolo26x-pose`，10 GB 以上用 l，7 GB 以上用 m，再小用 s。想固定就用 `--model yolo26l-pose.pt`。
+
+几个 v0.7 的行为要点：
+
+- **触发与恢复按时长而不是帧数**。以前按帧数计，手机 1.4 fps 的「连续 2 帧」是 1.4 秒，电脑 10 fps 只有 0.2 秒，两端根本不是一回事。现在换帧率、换后端都不影响判定。
+- **短暂看不清不清零计时**。抓一下脸、手挡住耳朵，只要不超过 `--invalid-grace-sec` 就只挂起计时，不用从头再来。
+- **髋被桌子挡住时沿用上次躯干方向**（`--torso-hold-sec`）。退回竖直参考等于换了角度口径，伏案时同一个姿势能从 11° 跳到 35° 直接误报；沿用躯干方向则数值不动。
+- **基线按后端和模型分开存**。`camera_monitor.json` 里是 `baselines: {"yolo:yolo26s-pose": 12.3, "mediapipe": 19.5}`。YOLO 与 MediaPipe 的关键点位置有系统偏差，共用一个基线会让阈值整体偏移，所以换后端后要各校准一次。旧版本的单个基线会自动迁移，先凑合用，建议重新校准。
 
 ## 推流协议
 

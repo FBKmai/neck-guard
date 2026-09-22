@@ -13,7 +13,10 @@ class PostureTrackerTest {
         absoluteThresholdDeg = 40f,
         calibrationDeltaDeg = 12f,
         hysteresisDeg = 4f,
-        minValidFramesPerWindow = 3,
+        // 窗内期望 24 帧（3000/125），按 1/8 得有效帧门槛 3，与 v0.6 用例的绝对值一致
+        minValidRatio = 1f / 8f,
+        minValidFramesFallback = 3,
+        minValidFramesFloor = 1,
         consecutiveBadWindows = 2,
         cooldownMillis = 10_000L,
     )
@@ -22,8 +25,10 @@ class PostureTrackerTest {
         slowIntervalMillis = 700L,
         fastIntervalMillis = 125L,
         confirmWindowMillis = 3_000L,
-        triggerFrames = 2,
-        recoverFrames = 3,
+        // 原来的 triggerFrames = 2 / recoverFrames = 3 在 700 ms 巡检下等价于这两个时长
+        triggerMillis = 700L,
+        recoverMillis = 1_400L,
+        invalidGraceMillis = 1_000L,
         retriggerHoldMillis = 5_000L,
         maxInvalidWindows = 2,
     )
@@ -87,23 +92,29 @@ class PostureTrackerTest {
     }
 
     @Test
-    fun triggerCount_resetByGoodFrame_andByNonValidFrame() {
+    fun triggerTimer_resetByGoodFrame() {
         val t = tracker()
         t.feed(0L, 50f)
         t.feed(700L, 20f)
-        assertTrue("正常帧应清零触发计数", t.feed(1_400L, 50f).isEmpty())
+        assertTrue("低于阈值的正常帧应清零触发计时", t.feed(1_400L, 50f).isEmpty())
         assertEquals(TrackerMode.SLOW, t.mode)
+    }
 
+    @Test
+    fun triggerTimer_clearedAfterInvalidGraceExpires() {
+        // 超过宽限期的无效段才清零；宽限期内只挂起，见 shortInvalidGap_suspendsTimer
         val t2 = tracker()
         t2.feed(0L, 50f)
         t2.onFrame(FrameResult.LowVisibility, 700L)
-        assertTrue("非有效帧应清零触发计数", t2.feed(1_400L, 50f).isEmpty())
+        t2.onFrame(FrameResult.LowVisibility, 1_800L)      // 距首个无效帧 1100 ms
+        assertTrue("看不清超过宽限期应清零触发计时", t2.feed(2_000L, 50f).isEmpty())
         assertEquals(TrackerMode.SLOW, t2.mode)
 
         val t3 = tracker()
         t3.feed(0L, 50f)
         t3.onFrame(FrameResult.Misaligned(measurement(50f)), 700L)
-        assertTrue("未对齐帧应清零触发计数", t3.feed(1_400L, 50f).isEmpty())
+        t3.onFrame(FrameResult.Misaligned(measurement(50f)), 1_800L)
+        assertTrue("未对齐超过宽限期应清零触发计时", t3.feed(2_000L, 50f).isEmpty())
     }
 
     @Test
@@ -343,17 +354,68 @@ class PostureTrackerTest {
             slowIntervalMillis = 0L,
             fastIntervalMillis = -5L,
             confirmWindowMillis = 10L,
-            triggerFrames = 0,
-            recoverFrames = 0,
+            triggerMillis = -1L,
+            recoverMillis = -1L,
+            invalidGraceMillis = -1L,
             retriggerHoldMillis = -1L,
             maxInvalidWindows = 0,
         ).sanitized()
         assertEquals(TrackerConfig.MIN_INTERVAL_MILLIS, bad.slowIntervalMillis)
         assertEquals(TrackerConfig.MIN_INTERVAL_MILLIS, bad.fastIntervalMillis)
         assertEquals(500L, bad.confirmWindowMillis)
-        assertEquals(1, bad.triggerFrames)
-        assertEquals(1, bad.recoverFrames)
+        assertEquals(0L, bad.triggerMillis)
+        assertEquals(0L, bad.recoverMillis)
+        assertEquals(0L, bad.invalidGraceMillis)
         assertEquals(0L, bad.retriggerHoldMillis)
         assertEquals(1, bad.maxInvalidWindows)
+    }
+
+    @Test
+    fun expectedFramesPerWindow_followsFastInterval() {
+        assertEquals(24, trackerConfig.expectedFramesPerWindow())               // 3000 / 125
+        assertEquals(
+            90,
+            trackerConfig.copy(fastIntervalMillis = 33L).expectedFramesPerWindow(),
+        )
+    }
+
+    @Test
+    fun shortInvalidGap_suspendsTimer_insteadOfClearing() {
+        // 抓一下脸这种短暂无效不该让触发计时白跑（v0.7 宽限期）
+        val t = tracker()
+        t.feed(0L, 50f)                                  // 计时起点 0
+        t.onFrame(FrameResult.NoPerson, 500L)            // 宽限期内（< 1000 ms），挂起
+        val events = t.feed(700L, 50f)                   // 累计 700 ms，达到 triggerMillis
+        val changed = events.filterIsInstance<TrackerEvent.ModeChanged>().single()
+        assertEquals(ModeChangeReason.TRIGGERED, changed.reason)
+    }
+
+    @Test
+    fun longInvalidGap_clearsTimer() {
+        val t = tracker()
+        t.feed(0L, 50f)
+        t.onFrame(FrameResult.NoPerson, 700L)
+        t.onFrame(FrameResult.NoTorso(measurement(50f)), 1_800L)   // 距首个无效帧 1100 ms，超宽限
+        assertTrue(t.feed(2_000L, 50f).isEmpty())                  // 计时重新开始
+        assertEquals(TrackerMode.SLOW, t.mode)
+        val changed = t.feed(2_700L, 50f).filterIsInstance<TrackerEvent.ModeChanged>().single()
+        assertEquals(ModeChangeReason.TRIGGERED, changed.reason)
+    }
+
+    @Test
+    fun trigger_isFrameRateIndependent() {
+        // 同样的 700 ms 持续前倾，1.4 fps 与 8 fps 都恰好触发，不早也不晚
+        val slow = tracker()
+        slow.feed(0L, 50f)
+        assertTrue(slow.feed(699L, 50f).isEmpty())
+        assertTrue(slow.feed(700L, 50f).isNotEmpty())
+
+        val fast = tracker()
+        var ms = 0L
+        while (ms < 700L) {
+            assertTrue(fast.feed(ms, 50f).isEmpty())
+            ms += 125L
+        }
+        assertTrue(fast.feed(700L, 50f).isNotEmpty())
     }
 }

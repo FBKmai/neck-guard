@@ -18,7 +18,9 @@ ANALYZER_CFG = pg.AnalyzerConfig(
     absolute_threshold_deg=40.0,
     calibration_delta_deg=12.0,
     hysteresis_deg=4.0,
-    min_valid_frames_per_window=3,
+    # 窗内期望 24 帧（3000/125），按 1/8 得有效帧门槛 3，与 v0.6 用例的绝对值一致
+    min_valid_ratio=1.0 / 8.0,
+    min_valid_frames_floor=1,
     consecutive_bad_windows=2,
     cooldown_millis=10_000,
 )
@@ -27,8 +29,10 @@ TRACKER_CFG = TrackerConfig(
     slow_interval_millis=700,
     fast_interval_millis=125,
     confirm_window_millis=3_000,
-    trigger_frames=2,
-    recover_frames=3,
+    # 原来的 trigger_frames=2 / recover_frames=3 在 700 ms 巡检下等价于这两个时长
+    trigger_millis=700,
+    recover_millis=1_400,
+    invalid_grace_millis=1_000,
     retrigger_hold_millis=5_000,
     max_invalid_windows=2,
 )
@@ -91,19 +95,44 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(t.mode, FAST)
         self.assertEqual(t.desired_interval_millis, 125)
 
-    def test_trigger_count_reset_by_good_frame_and_by_non_valid_frame(self):
+    def test_trigger_timer_reset_by_good_frame(self):
         t = tracker()
         feed(t, 0, 50.0)
-        feed(t, 700, 20.0)          # 正常帧清零
+        feed(t, 700, 20.0)          # 低于阈值的正常帧清零计时
         self.assertEqual(feed(t, 1400, 50.0), [])
-        t2 = tracker()
-        feed(t2, 0, 50.0)
-        t2.on_frame(pg.NO_PERSON, None, 700)   # 无效帧也清零
-        self.assertEqual(feed(t2, 1400, 50.0), [])
-        t3 = tracker()
-        feed(t3, 0, 50.0)
-        t3.on_frame(pg.NO_TORSO, meas(50.0), 700)  # 没有躯干线同样清零
-        self.assertEqual(feed(t3, 1400, 50.0), [])
+        self.assertEqual(t.mode, SLOW)
+
+    def test_short_invalid_gap_suspends_timer_instead_of_clearing(self):
+        """抓一下脸这种短暂无效不该让触发计时白跑（v0.7 宽限期）。"""
+        t = tracker()
+        feed(t, 0, 50.0)                        # 计时起点 0
+        t.on_frame(pg.NO_PERSON, None, 500)     # 宽限期内（< 1000 ms），计时挂起
+        events = feed(t, 700, 50.0)             # 累计 700 ms，达到 trigger_millis
+        changed = kinds(events, EV_MODE_CHANGED)
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(changed[0].reason, TRIGGERED)
+
+    def test_long_invalid_gap_clears_timer(self):
+        t = tracker()
+        feed(t, 0, 50.0)
+        t.on_frame(pg.NO_PERSON, None, 700)
+        t.on_frame(pg.NO_TORSO, meas(50.0), 1_800)   # 距首个无效帧 1100 ms，超宽限
+        self.assertEqual(feed(t, 2_000, 50.0), [])   # 计时从头开始
+        self.assertEqual(t.mode, SLOW)
+        # 再攒够 trigger_millis 才触发
+        changed = kinds(feed(t, 2_700, 50.0), EV_MODE_CHANGED)
+        self.assertEqual(changed[0].reason, TRIGGERED)
+
+    def test_trigger_is_frame_rate_independent(self):
+        """同样的 700 ms 持续前倾，1.4 fps 与 8 fps 都恰好触发，不早也不晚。"""
+        slow = tracker()
+        feed(slow, 0, 50.0)
+        self.assertEqual(kinds(feed(slow, 699, 50.0), EV_MODE_CHANGED), [])
+        self.assertTrue(kinds(feed(slow, 700, 50.0), EV_MODE_CHANGED))
+        fast = tracker()
+        for ms in range(0, 700, 125):
+            self.assertEqual(kinds(feed(fast, ms, 50.0), EV_MODE_CHANGED), [])
+        self.assertTrue(kinds(feed(fast, 700, 50.0), EV_MODE_CHANGED))
 
     def test_fast_frames_produce_frame_added_with_same_window_seq(self):
         t = tracker()
@@ -197,7 +226,7 @@ class TrackerTest(unittest.TestCase):
         base = start + 7_000
         feed(t, base, 30.0)
         feed(t, base + 700, 30.0)
-        events = feed(t, base + 1_400, 30.0)      # recover_frames = 3
+        events = feed(t, base + 1_400, 30.0)      # 累计 1400 ms，达到 recover_millis
         recovered = kinds(events, EV_RECOVERED)
         self.assertEqual(len(recovered), 1)
         self.assertFalse(t.in_forward_head)
@@ -287,21 +316,41 @@ class TrackerTest(unittest.TestCase):
         feed(t, 0, 50.0)
         snap = t.snapshot()
         self.assertEqual(snap.mode, SLOW)
-        self.assertEqual(snap.trigger_progress, 1)
+        self.assertEqual(snap.trigger_progress_millis, 0)   # 只有一帧，还没累计出时长
+        feed(t, 400, 50.0)
+        self.assertEqual(t.snapshot().trigger_progress_millis, 400)
         self.assertFalse(snap.forward_head)
         self.assertAlmostEqual(snap.threshold_deg, 40.0)
 
     def test_config_sanitized_against_bad_input(self):
         cfg = TrackerConfig(slow_interval_millis=0, fast_interval_millis=-5, confirm_window_millis=0,
-                            trigger_frames=0, recover_frames=0, retrigger_hold_millis=-1,
-                            max_invalid_windows=0).sanitized()
+                            trigger_millis=-1, recover_millis=-1, invalid_grace_millis=-1,
+                            retrigger_hold_millis=-1, max_invalid_windows=0).sanitized()
         self.assertEqual(cfg.slow_interval_millis, 30)
         self.assertEqual(cfg.fast_interval_millis, 30)
         self.assertEqual(cfg.confirm_window_millis, 500)
-        self.assertEqual(cfg.trigger_frames, 1)
-        self.assertEqual(cfg.recover_frames, 1)
+        self.assertEqual(cfg.trigger_millis, 0)
+        self.assertEqual(cfg.recover_millis, 0)
+        self.assertEqual(cfg.invalid_grace_millis, 0)
         self.assertEqual(cfg.retrigger_hold_millis, 0)
         self.assertEqual(cfg.max_invalid_windows, 1)
+
+    def test_observe_frame_interval_corrects_window_gate(self):
+        """电脑端全速跑时用实测帧率校正窗门槛（v0.7）。"""
+        t = tracker()
+        self.assertEqual(t.config.expected_frames_per_window(), 24)
+        t.observe_frame_interval(33)                       # 实测约 30 fps
+        self.assertEqual(t.config.fast_interval_millis, 33)
+        self.assertEqual(t.config.expected_frames_per_window(), 90)
+        t.observe_frame_interval(0)                        # 非法值忽略
+        self.assertEqual(t.config.fast_interval_millis, 33)
+        t.observe_frame_interval(99_999)                   # 夹到上限
+        self.assertEqual(t.config.fast_interval_millis, 5_000)
+
+    def test_expected_frames_per_window(self):
+        self.assertEqual(TRACKER_CFG.expected_frames_per_window(), 24)   # 3000 / 125
+        self.assertEqual(TrackerConfig(confirm_window_millis=3_000,
+                                       fast_interval_millis=33).expected_frames_per_window(), 90)
 
 
 if __name__ == "__main__":

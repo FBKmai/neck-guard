@@ -15,8 +15,16 @@ data class AnalyzerConfig(
     val thresholdMaxDeg: Float = 50f,
     /** 迟滞：进入前倾需 > 阈值，退出需 < 阈值 - hysteresis。 */
     val hysteresisDeg: Float = 4f,
-    /** 一个采样窗内至少多少个有效帧才算有效窗。 */
-    val minValidFramesPerWindow: Int = 8,
+    /**
+     * 有效帧至少要占「按送帧间隔推算的期望帧数」的多少。
+     * v0.7 起改用比例：默认 1/3 与旧的 8 帧 / 期望 24 帧等价，
+     * 但换帧率（手机 8 fps、电脑 30 fps）后窗的松紧不再随之漂移。
+     */
+    val minValidRatio: Float = 1f / 3f,
+    /** beginWindow 没给期望帧数时退回的绝对帧数门槛。 */
+    val minValidFramesFallback: Int = 8,
+    /** 无论比例算出多少，有效帧都不得少于这个数，避免窗很短时 1 帧就定生死。 */
+    val minValidFramesFloor: Int = 2,
     /** 连续多少个 BAD 窗才确认前倾。 */
     val consecutiveBadWindows: Int = 2,
     /** 两次通知之间的最小间隔。 */
@@ -86,14 +94,29 @@ class PostureAnalyzer(config: AnalyzerConfig = AnalyzerConfig()) {
     private var misalignedFrames = 0
     private var noTorsoFrames = 0
     private var frameCounter = 0
+    private var expectedFrames = 0
 
+    /**
+     * 开始一个新窗。[expectedFrames] 是按送帧间隔推算的本窗期望帧数，
+     * 0 表示未知，此时窗有效性退回绝对帧数门槛。
+     */
     @Synchronized
-    fun beginWindow() {
+    fun beginWindow(expectedFrames: Int = 0) {
         validFrames.clear()
         totalFrames = 0
         misalignedFrames = 0
         noTorsoFrames = 0
         frameCounter = 0
+        this.expectedFrames = expectedFrames.coerceAtLeast(0)
+    }
+
+    /** 本窗的有效帧门槛：期望帧数已知时按比例算，未知时退回绝对帧数。 */
+    @Synchronized
+    fun minValidFrames(): Int {
+        val cfg = config
+        val floor = cfg.minValidFramesFloor.coerceAtLeast(1)
+        if (expectedFrames <= 0) return maxOf(floor, cfg.minValidFramesFallback)
+        return maxOf(floor, Math.round(expectedFrames * cfg.minValidRatio))
     }
 
     /** 返回该帧在本窗内的序号，调用方可用它保存对应的图像以便之后取代表帧。 */
@@ -115,7 +138,7 @@ class PostureAnalyzer(config: AnalyzerConfig = AnalyzerConfig()) {
         val cfg = config
         val threshold = thresholdFor(baselineDeg, cfg)
 
-        if (validFrames.size < cfg.minValidFramesPerWindow) {
+        if (validFrames.size < minValidFrames()) {
             val summary = WindowSummary(
                 verdict = WindowVerdict.INVALID,
                 medianNeckDeg = null,

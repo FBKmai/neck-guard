@@ -26,6 +26,8 @@ NO_PERSON = "NO_PERSON"
 
 # 颈角用的参考方向
 REF_TORSO = "TORSO"
+#: 髋刚丢失，沿用最近一次可靠的躯干方向。口径与 REF_TORSO 相同，数值可直接比较
+REF_TORSO_HELD = "TORSO_HELD"
 REF_VERTICAL = "VERTICAL"
 
 # end_window() 返回的判定
@@ -61,6 +63,31 @@ class Measurement:
 
 
 @dataclass
+class TorsoHint:
+    """最近一次可靠的躯干方向，由调用方持有并逐帧传入。
+
+    髋被手或桌子短暂挡住时，与其让整帧作废（NO_TORSO 不参与判定）或改用
+    竖直参考（换了口径，角度会跳十几度），不如沿用刚才那条躯干线：
+    躯干方向变化远比帧间隔慢，一两秒内几乎不动。
+    """
+
+    #: 归一化的躯干方向（由髋指向肩），已单位化
+    dx: float
+    dy: float
+    #: 该方向来自哪一帧（毫秒），用于判断是否过期
+    at_millis: int
+
+
+def torso_hint_from(hip: Point, shoulder: Point, now_ms: int) -> Optional[TorsoHint]:
+    """从一帧可靠的髋肩点生成方向提示。两点重合时返回 None。"""
+    dx, dy = shoulder[0] - hip[0], shoulder[1] - hip[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-4:
+        return None
+    return TorsoHint(dx / length, dy / length, now_ms)
+
+
+@dataclass
 class GeometryConfig:
     min_visibility: float = 0.5
     max_shoulder_offset_ratio: float = 0.35
@@ -68,6 +95,10 @@ class GeometryConfig:
     require_hip: bool = True
     #: 髋肩距离至少要有耳肩距离的多少倍，低于此值认为髋点不可靠
     min_torso_to_neck_ratio: float = 0.8
+    #: 另一侧的可用度要高出当前侧这么多才换边，避免逐帧翻转导致角度跳变
+    side_switch_margin: float = 0.15
+    #: 髋丢失后，最近一次可靠的躯干方向还能沿用多久（毫秒）。0 表示关掉这个兜底
+    torso_hold_millis: int = 2_000
 
 
 def median(values: Sequence[float]) -> float:
@@ -87,16 +118,19 @@ def inclination_from_vertical(frm: Point, to: Point) -> float:
     return math.degrees(math.acos(cos))
 
 
-def angle_between(a1: Point, a2: Point, b1: Point, b2: Point) -> float:
-    """向量 a1->a2 与 b1->b2 的夹角，度，范围 0..180。任一向量为 0 时返回 0。"""
-    ax, ay = a2[0] - a1[0], a2[1] - a1[1]
-    bx, by = b2[0] - b1[0], b2[1] - b1[1]
+def angle_between_vectors(ax: float, ay: float, bx: float, by: float) -> float:
+    """两个向量的夹角，度，范围 0..180。任一向量为 0 时返回 0。"""
     la = math.hypot(ax, ay)
     lb = math.hypot(bx, by)
     if la < 1e-4 or lb < 1e-4:
         return 0.0
     cos = max(-1.0, min(1.0, (ax * bx + ay * by) / (la * lb)))
     return math.degrees(math.acos(cos))
+
+
+def angle_between(a1: Point, a2: Point, b1: Point, b2: Point) -> float:
+    """向量 a1->a2 与 b1->b2 的夹角，度，范围 0..180。任一向量为 0 时返回 0。"""
+    return angle_between_vectors(a2[0] - a1[0], a2[1] - a1[1], b2[0] - b1[0], b2[1] - b1[1])
 
 
 def neck_relative_to_torso(hip: Point, shoulder: Point, ear: Point) -> float:
@@ -108,24 +142,73 @@ def distance(a: Point, b: Point) -> float:
     return math.hypot(b[0] - a[0], b[1] - a[1])
 
 
-def pick_side(lms: Sequence[Landmark]) -> str:
-    """用耳朵 visibility 决定使用哪一侧的关键点。"""
-    return "LEFT" if lms[LEFT_EAR].visibility >= lms[RIGHT_EAR].visibility else "RIGHT"
+def side_score(lms: Sequence[Landmark], side: str) -> Tuple[float, float]:
+    """一侧的可用度，返回 (耳肩链得分, 含髋链得分)，都取各自链上最弱的一点。
+
+    耳肩髋是串联关系，任何一点崩掉整条向量都会崩，所以取 min 而不是平均。
+    只看耳朵会在「耳朵清楚但肩很糊」时选错边。
+
+    分成两档是因为髋经常被桌子挡住：那时两侧的含髋得分都接近 0，直接比会
+    退化成掷硬币，此时应该回到耳肩这一档上比较。
+    """
+    if side == "LEFT":
+        ear_i, sh_i, hip_i = LEFT_EAR, LEFT_SHOULDER, LEFT_HIP
+    else:
+        ear_i, sh_i, hip_i = RIGHT_EAR, RIGHT_SHOULDER, RIGHT_HIP
+    neck = min(lms[ear_i].visibility, lms[sh_i].visibility)
+    return neck, min(neck, lms[hip_i].visibility)
+
+
+def pick_side(lms: Sequence[Landmark], current: Optional[str] = None,
+              switch_margin: float = 0.15, min_visibility: float = 0.5) -> str:
+    """选用哪一侧的关键点。
+
+    先比含髋的整条链；两侧的髋都不可用时退回只比耳肩，避免被两个同样接近 0
+    的髋置信度主导。current 是上一帧用的侧别，给了它就带切换粘性：另一侧要
+    高出 switch_margin 才换边，否则两边得分接近时会逐帧翻转让角度跳变。
+    """
+    left_neck, left_full = side_score(lms, "LEFT")
+    right_neck, right_full = side_score(lms, "RIGHT")
+    # 两侧都没有可用的髋时，含髋得分没有区分度，改比耳肩
+    if left_full < min_visibility and right_full < min_visibility:
+        left, right = left_neck, right_neck
+    else:
+        left, right = left_full, right_full
+    if current is None:
+        return "LEFT" if left >= right else "RIGHT"
+    other = "RIGHT" if current == "LEFT" else "LEFT"
+    current_score = left if current == "LEFT" else right
+    other_score = right if current == "LEFT" else left
+    return other if other_score > current_score + switch_margin else current
+
+
+def _hint_usable(hint: Optional[TorsoHint], now_ms: Optional[int], hold_millis: int) -> bool:
+    """方向提示是否还在保留期内。缺时间戳或关掉保留期时一律不用。"""
+    if hint is None or now_ms is None or hold_millis <= 0:
+        return False
+    age = now_ms - hint.at_millis
+    return 0 <= age <= hold_millis
 
 
 def analyze(lms: Optional[Sequence[Landmark]], width: int, height: int,
-            cfg: GeometryConfig = GeometryConfig()) -> Tuple[str, Optional[Measurement]]:
+            cfg: GeometryConfig = GeometryConfig(),
+            current_side: Optional[str] = None,
+            torso_hint: Optional[TorsoHint] = None,
+            now_ms: Optional[int] = None) -> Tuple[str, Optional[Measurement]]:
     """返回 (status, measurement)。
 
     status ∈ {VALID, MISALIGNED, NO_TORSO, LOW_VISIBILITY, NO_PERSON}；
     仅 VALID / MISALIGNED / NO_TORSO 时 measurement 非 None。
+
+    current_side 是上一帧用的侧别，传了就带切换粘性（见 pick_side）。
+    保持纯函数：状态由调用方持有，本函数不记忆任何东西。
     """
     if lms is None or len(lms) < LANDMARK_COUNT:
         return NO_PERSON, None
     if width <= 0 or height <= 0:
         raise ValueError("image size must be positive")
 
-    side = pick_side(lms)
+    side = pick_side(lms, current_side, cfg.side_switch_margin, cfg.min_visibility)
     if side == "LEFT":
         ear_i, sh_i, far_i, hip_i = LEFT_EAR, LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP
     else:
@@ -153,6 +236,11 @@ def analyze(lms: Optional[Sequence[Landmark]], width: int, height: int,
     if hip is not None:
         reference = REF_TORSO
         neck = neck_relative_to_torso(hip, shoulder, ear)
+    elif _hint_usable(torso_hint, now_ms, cfg.torso_hold_millis):
+        # 髋刚丢，沿用最近一次可靠的躯干方向：口径不变，角度可以直接跟之前比
+        reference = REF_TORSO_HELD
+        neck = angle_between_vectors(torso_hint.dx, torso_hint.dy,
+                                     ear[0] - shoulder[0], ear[1] - shoulder[1])
     else:
         reference = REF_VERTICAL
         neck = inclination_from_vertical(shoulder, ear)
@@ -169,9 +257,42 @@ def analyze(lms: Optional[Sequence[Landmark]], width: int, height: int,
     # 对齐问题优先提示：摆放不对时算出来的角度本来也不可信
     if not aligned:
         return MISALIGNED, m
-    if hip is None and cfg.require_hip:
+    # REF_TORSO_HELD 与 REF_TORSO 是同一个口径，可以照常参与判定；
+    # 只有退到竖直参考（换了口径）才在 require_hip 下跳过这一帧
+    if reference == REF_VERTICAL and cfg.require_hip:
         return NO_TORSO, m
     return VALID, m
+
+
+class SideAndTorsoMemory:
+    """analyze 的逐帧记忆：上一帧的侧别 + 最近一次可靠的躯干方向。
+
+    analyze 本身保持纯函数，这点状态放在这里，三个调用方（手机服务、手机
+    预览页、电脑脚本）共用同一套语义，不必各写一遍。单线程使用，不加锁。
+    """
+
+    def __init__(self, cfg: GeometryConfig = GeometryConfig()):
+        self.cfg = cfg
+        self.side: Optional[str] = None
+        self.torso_hint: Optional[TorsoHint] = None
+
+    def analyze(self, lms: Optional[Sequence[Landmark]], width: int, height: int,
+                now_ms: Optional[int] = None) -> Tuple[str, Optional[Measurement]]:
+        status, m = analyze(lms, width, height, self.cfg, self.side, self.torso_hint, now_ms)
+        if m is None:
+            return status, m
+        self.side = m.side
+        # 只有这一帧真的有可靠的髋，才刷新方向提示；沿用的帧不能自我续期，
+        # 否则髋一直不出现也能无限续下去，保留期就形同虚设。
+        if m.neck_reference == REF_TORSO and m.hip is not None and now_ms is not None:
+            hint = torso_hint_from(m.hip, m.shoulder, now_ms)
+            if hint is not None:
+                self.torso_hint = hint
+        return status, m
+
+    def reset(self) -> None:
+        self.side = None
+        self.torso_hint = None
 
 
 @dataclass
@@ -182,7 +303,13 @@ class AnalyzerConfig:
     threshold_min_deg: float = 20.0
     threshold_max_deg: float = 50.0
     hysteresis_deg: float = 4.0
-    min_valid_frames_per_window: int = 8
+    #: 有效帧至少要占「按送帧间隔推算的期望帧数」的多少。
+    #: 默认 1/3 与 v0.6 的 8 帧 / 期望 24 帧等价，但换帧率后不会变松或变紧。
+    min_valid_ratio: float = 1.0 / 3.0
+    #: begin_window() 没给期望帧数时退回的绝对帧数门槛
+    min_valid_frames_fallback: int = 8
+    #: 无论比例算出多少，有效帧都不得少于这个数，避免窗很短时 1 帧就定生死
+    min_valid_frames_floor: int = 2
     consecutive_bad_windows: int = 2
     cooldown_millis: int = 10 * 60 * 1000
 
@@ -207,17 +334,28 @@ class PostureAnalyzer:
         self._misaligned = 0
         self._no_torso = 0
         self._counter = 0
+        self._expected = 0
 
     @property
     def threshold(self) -> float:
         return threshold_for(self.baseline, self.cfg)
 
-    def begin_window(self) -> None:
+    def begin_window(self, expected_frames: int = 0) -> None:
+        """expected_frames 是按送帧间隔推算的本窗期望帧数，0 表示未知（退回绝对帧数门槛）。"""
         self._valid.clear()
         self._total = 0
         self._misaligned = 0
         self._no_torso = 0
         self._counter = 0
+        self._expected = max(0, expected_frames)
+
+    def min_valid_frames(self) -> int:
+        """本窗的有效帧门槛：期望帧数已知时按比例算，未知时退回绝对帧数。"""
+        cfg = self.cfg
+        floor = max(1, cfg.min_valid_frames_floor)
+        if self._expected <= 0:
+            return max(floor, cfg.min_valid_frames_fallback)
+        return max(floor, round(self._expected * cfg.min_valid_ratio))
 
     def add_frame(self, status: str, m: Optional[Measurement]) -> int:
         """返回该帧在本窗内的序号，可用来对应保存的图像。"""
@@ -236,7 +374,7 @@ class PostureAnalyzer:
         thr = self.threshold
         base = dict(threshold=thr, total=self._total, valid=len(self._valid),
                     misaligned=self._misaligned, no_torso=self._no_torso)
-        if len(self._valid) < self.cfg.min_valid_frames_per_window:
+        if len(self._valid) < self.min_valid_frames():
             return dict(base, verdict=INVALID, median_neck=None, median_torso=None,
                         representative_index=None, representative=None,
                         bad_streak=self.bad_streak, confirmed=False,

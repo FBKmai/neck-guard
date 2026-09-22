@@ -51,9 +51,22 @@ v1 的目标是验证"侧面摄像头 + 姿态关键点 + 角度阈值"这条路
 
 Kotlin 端 `pose/PostureGeometry.kt`、`pose/PostureAnalyzer.kt` 与 Python 端 `tools/posture_geometry.py` 使用完全一致的定义。
 
-### 4.1 选可见侧
+### 4.1 选可见侧（v0.7 起看整条链 + 切换粘性）
 
-左右耳分别取 visibility，更高的那一侧作为本帧的"近侧"，耳、肩、髋都取该侧的关键点。耳与肩的 visibility 都必须 `>= 0.5`，否则该帧记为 `LowVisibility`；关键点列表为空记为 `NoPerson`。
+**v0.6 及更早**只比左右耳的 visibility。问题在于耳肩髋是串联关系，一个点崩掉整条向量都会崩，而耳朵清楚不代表同侧的肩和髋也清楚。左耳 0.91 / 左肩 0.54 / 左髋 0.52 对上右耳 0.82 / 右肩 0.94 / 右髋 0.96 时，旧逻辑会选明显更不稳的左侧。
+
+**v0.7 起**一侧的可用度取该侧链上最弱的一点，并分成两档：
+
+```
+neckScore = min(ear, shoulder)              // 耳肩链
+fullScore = min(neckScore, hip)             // 含髋的整条链
+```
+
+先比 `fullScore`；**两侧的 `fullScore` 都低于 `minVisibility` 时改比 `neckScore`**。因为伏案时两边的髋经常一起被桌子挡住，这时两个 `fullScore` 都接近 0，直接比会退化成掷硬币。
+
+还有**切换粘性**：传入上一帧用的侧别后，另一侧要高出 `sideSwitchMargin`（默认 0.15）才换边。两边得分接近时逐帧翻转会让角度无谓跳变，而左右关键点的预测位置本来就有几度系统差异。
+
+`PostureGeometry.analyze` 保持纯函数，这点状态由 `SideAndTorsoMemory` 持有（Python 同名类），三个调用方共用同一套语义。耳与肩的 visibility 都必须 `>= 0.5`，否则该帧记为 `LowVisibility`；关键点列表为空记为 `NoPerson`。
 
 ### 4.2 侧面对齐检查
 
@@ -93,7 +106,11 @@ neck = acos(cos)  转成角度，范围 0..180
 
 躯干倾角 `torso = angle(hip -> shoulder, 竖直向上)` 仍按旧公式计算，只做显示与记录，不参与判定。
 
-**没有躯干线的帧**：髋 visibility 低于 0.5，或髋肩距离不足耳肩距离的 0.8 倍（髋点落在肩上，方向是噪声）时，该帧记为 `NoTorso`，角度退化为竖直口径仅供 UI 显示，**不计入判定**。设置页的"必须看到髋部"关掉后改为退回竖直参考并照常判定，适合髋部长期被桌子挡住、且不会躺着用的场景。
+**没有躯干线的帧**：髋 visibility 低于 0.5，或髋肩距离不足耳肩距离的 0.8 倍（髋点落在肩上，方向是噪声）时，本帧没有可靠的躯干线。
+
+**v0.7 起先尝试沿用最近一次可靠的躯干方向**（`torsoHoldMillis`，默认 2 秒）。躯干方向变化远比帧间隔慢，手抬起来挡一下髋的一两秒里它几乎不动，而退回竖直参考等于换了口径：伏案（躯干前倾约 33°）时同一个姿势，相对躯干线是 11.4°，相对竖直线是 35.0°，人没动角度却跳了 23.6°，直接越过 35° 阈值误报。沿用期内 `neckReference` 记为 `TORSO_HELD`，与 `TORSO` 同口径，**照常参与判定**。
+
+沿用的帧不给自己续期，否则髋一直不出现也能无限续下去。超过保留期后才退化为竖直口径（`VERTICAL`），此时记为 `NoTorso` 仅供 UI 显示，**不计入判定**。设置页的"必须看到髋部"关掉后改为退回竖直参考并照常判定，适合髋部长期被桌子挡住、且不会躺着用的场景。
 
 ### 4.4 校准与迟滞
 
@@ -107,15 +124,32 @@ threshold = baseline == null ? 35° : clamp(baseline + 12°, 20°, 50°)
 绝对阈值与 clamp 下限比 v0.4 低（40 → 35、30 → 20），因为新口径扣掉了躯干本身的前倾，同样的姿势算出的角度更小。
 
 - 迟滞：进入前倾需 `median > threshold`，退出前倾需 `median < threshold - 4°`，避免在临界值附近反复翻转。
-- 升级迁移：DataStore 里存了 `geometry_version`，读到小于 2 的值说明基线与绝对阈值是旧口径，一律重置为未校准 + 新默认值，用户重新校准一次即可。
+- 升级迁移：DataStore 里存了 `geometry_version`，读到小于 2 的值说明基线与绝对阈值是旧口径，一律重置为未校准 + 新默认值，用户重新校准一次即可。v0.7 另外把帧数口径的三个旧键（`trigger_frames` / `recover_frames` / `min_valid_frames`）按当时的送帧节奏折算成时长与比例，用户不必重设。
+- **电脑端基线按后端分开存（v0.7）**：YOLO 与 MediaPipe 虽然都给耳肩髋，但关键点的定义位置不完全一样，同一坐姿两边算出的角度会差几度；换模型大小（s/m/l/x）也有类似的系统偏差。`pc/camera_monitor.json` 里改成 `baselines: {profile: 基线}`，profile 形如 `yolo:yolo26s-pose` 或 `mediapipe`。v0.6 的单个 `baseline_deg` 迁到一个临时 key 上，任何 profile 都能先用上，按 profile 存过一次后清掉。手机端只有 MediaPipe 一个后端，不受影响。
 
-### 4.5 双速检测状态机（v0.3）
+### 4.5 双速检测状态机（v0.3，v0.7 改为按时长计量）
 
 v0.2 的定时采样窗（每 45±15 s 开相机 3 s）在两次采样之间存在监控盲区，实测也只有 7-10 fps。v0.3 改为相机常开的双速检测：
 
-- **巡检（SLOW）**：默认每 700 ms 分析一帧（约 1.4 fps），只做逐帧比较，不进窗聚合。连续 `triggerFrames`（默认 2）个有效帧超过阈值就进入确认。
-- **确认（FAST）**：默认每 125 ms 一帧（约 8 fps），开一个 `confirmWindowMillis`（默认 3 s）的窗，窗聚合、中位数、迟滞、连续窗计数与冷却全部复用 4.4 的 `PostureAnalyzer`，语义与 v0.2 完全一致。窗判为 BAD 但未连够 K 个窗时背靠背再开一窗；判为 GOOD 立刻回巡检；连续 `maxInvalidWindows`（默认 2）个无效窗也回巡检，避免无人时空跑高帧率。
-- **前倾中（S2）**：确认后回到巡检帧率但保持前倾状态，等待恢复。连续 `recoverFrames`（默认 5）个有效帧低于「阈值 - 迟滞」判为恢复，发 RECOVERED 事件；若始终不恢复，且距确认已超过 `retriggerHoldMillis`（默认 30 s）并且通知冷却也已过，则重新进入确认再提醒一次。
+- **巡检（SLOW）**：默认每 700 ms 分析一帧（约 1.4 fps），只做逐帧比较，不进窗聚合。超过阈值持续 `triggerMillis`（默认 1400 ms）就进入确认。
+- **确认（FAST）**：默认每 125 ms 一帧（约 8 fps），开一个 `confirmWindowMillis`（默认 3 s）的窗，窗聚合、中位数、迟滞、连续窗计数与冷却全部复用 4.4 的 `PostureAnalyzer`。窗判为 BAD 但未连够 K 个窗时背靠背再开一窗；判为 GOOD 立刻回巡检；连续 `maxInvalidWindows`（默认 2）个无效窗也回巡检，避免无人时空跑高帧率。
+- **前倾中（S2）**：确认后回到巡检帧率但保持前倾状态，等待恢复。低于「阈值 - 迟滞」持续 `recoverMillis`（默认 3500 ms）判为恢复，发 RECOVERED 事件；若始终不恢复，且距确认已超过 `retriggerHoldMillis`（默认 30 s）并且通知冷却也已过，则重新进入确认再提醒一次。
+
+**v0.7：帧数口径改成时长口径。** v0.6 的触发、恢复与窗有效性都按帧数计，而两端的帧率差了一个量级，设计文档里"判定语义完全相同"其实是假的：
+
+| 参数 | 手机巡检 700 ms | 电脑拉流 10 fps | 电脑 30 fps |
+|------|------|------|------|
+| 触发 2 帧 | 1.4 s | 0.2 s | 0.07 s |
+| 恢复 5 帧 | 3.5 s | 0.5 s | 0.17 s |
+| 窗内 8 有效帧 | 占期望帧数 33% | 27% | 9% |
+
+改动三处：
+
+- 触发与恢复记**计时起点**而不是计数，`triggerMillis` / `recoverMillis` 直接是毫秒。
+- 窗有效性改成 `有效帧 >= 期望帧数 × minValidRatio`（默认 1/3，与旧的 8 帧 / 期望 24 帧等价），期望帧数由 `confirmWindowMillis / fastIntervalMillis` 推算，下限 `minValidFramesFloor` 兜住窗很短的情况。电脑端不节流，`PostureTracker.observe_frame_interval()` 用实测帧率持续校正。
+- **无效帧宽限期**（`invalidGraceMillis`，默认 1 s）：v0.6 里巡检期任何一帧无效都让计时清零，1.4 fps 下摸一次脸就要从头再来。现在宽限期内只挂起计时，超过才作废。确认窗内不受影响（无效帧本来就只是不计入）。
+
+这样 1.4 fps、8 fps、30 fps 三种节奏下行为完全一致，以后换推理后端也不必重调参数。
 
 恢复时调用 `markRecovered()` 而非 `resetState()`：清掉前倾状态与连续计数，但**保留冷却**，所以刚恢复又前倾不会立刻重复提醒。确认后也不清 `badStreak`，重触发时一个 BAD 窗即可再次确认。
 
@@ -187,10 +221,10 @@ stateDiagram-v2
 
 | 文件 | 职责 |
 |------|------|
-| `pose/PostureGeometry.kt` | 纯函数：选侧、像素坐标还原、前倾角（相对躯干线）与躯干倾角、对齐比、帧结果分类 |
-| `pose/PostureAnalyzer.kt` | 采样窗状态机：窗聚合、中位数、迟滞、连续计数、冷却、校准、代表帧 |
+| `pose/PostureGeometry.kt` | 纯函数：选侧（整条链最弱点 + 粘性）、像素坐标还原、前倾角（相对躯干线）与躯干倾角、对齐比、帧结果分类。`SideAndTorsoMemory` 持有逐帧状态（上一帧侧别 + 最近一次可靠的躯干方向） |
+| `pose/PostureAnalyzer.kt` | 采样窗状态机：窗聚合、中位数、迟滞、连续计数、冷却、校准、代表帧。窗有效性按期望帧数的比例判定 |
 | `pose/PoseLandmarkerEngine.kt` | MediaPipe LIVE_STREAM 封装：模型加载、帧旋转、可运行时切换的节流、GPU/CPU 委托、结果与错误回调 |
-| `pose/PostureTracker.kt` | 巡检/确认双速状态机：逐帧触发与恢复判定，窗聚合委托给 `PostureAnalyzer` |
+| `pose/PostureTracker.kt` | 巡检/确认双速状态机：按时长计的触发与恢复判定（含无效帧宽限期），窗聚合委托给 `PostureAnalyzer` |
 | `camera/CameraLens.kt` | 镜头与分析分辨率枚举 |
 | `camera/CameraUseCases.kt` | 预览页与服务共用的 ImageAnalysis / Preview 构建器 |
 | `camera/CameraLensResolver.kt` | 超广角四路解析、绑定后变焦、相机诊断 |
@@ -216,9 +250,10 @@ stateDiagram-v2
 
 ### 7.1 单元测试（CI 每次执行）
 
-- `PostureGeometryTest`：耳在肩正上方 0°、水平 90°、对角 45°、镜像对称；两向量夹角（共线 / 垂直 / 反向 / 退化）；像素坐标而非归一化坐标；躺平共线为 0°、躯干前倾被扣除；左右侧选择；低可见度、无人、未对齐、远肩遮挡；髋缺失与髋贴肩判为 `NoTorso`、关掉 `requireHip` 后退回竖直。
-- `PostureAnalyzerTest`：中位数奇偶；阈值 clamp 与新默认值；INVALID 窗不动 streak；未对齐帧与无躯干线帧只计数；K 连续确认；GOOD 清零；冷却压制与恢复；迟滞进出；校准重置状态；代表帧最接近中位数；躯干中位数忽略 null；`markRecovered` 保留冷却；`canNotify`；退出线。
-- `PostureTrackerTest`：巡检不产生窗帧；连续帧触发并切换节流；触发计数被正常帧与无效帧清零；窗到期（帧驱动与 tick 驱动）；连续无效窗退回巡检；K 窗确认；GOOD 窗打断；恢复判定保留冷却；迟滞带内不动作；重触发受 hold 与冷却双重限制；配置热更新与重置。
+- `PostureGeometryTest`：耳在肩正上方 0°、水平 90°、对角 45°、镜像对称；两向量夹角（共线 / 垂直 / 反向 / 退化）；像素坐标而非归一化坐标；躺平共线为 0°、躯干前倾被扣除；低可见度、无人、未对齐、远肩遮挡；髋缺失与髋贴肩、关掉 `requireHip` 后退回竖直。**v0.7 新增**：选侧取整条链最弱点、切换粘性、两侧髋都不可见时回退耳肩链；躯干方向保留期内角度不跳变、沿用帧不自我续期、保留期为 0 时关闭、伏案场景下退回竖直会跳 23.6° 而保留方向不会。
+- `PostureAnalyzerTest`：中位数奇偶；阈值 clamp 与新默认值；INVALID 窗不动 streak；未对齐帧与无躯干线帧只计数；K 连续确认；GOOD 清零；冷却压制与恢复；迟滞进出；校准重置状态；代表帧最接近中位数；躯干中位数忽略 null；`markRecovered` 保留冷却；`canNotify`；退出线。**v0.7 新增**：窗门槛随期望帧数按比例缩放、低于比例判 INVALID。
+- `PostureTrackerTest`：巡检不产生窗帧；触发后切换节流；窗到期（帧驱动与 tick 驱动）；连续无效窗退回巡检；K 窗确认；GOOD 窗打断；恢复判定保留冷却；迟滞带内不动作；重触发受 hold 与冷却双重限制；配置热更新与重置。**v0.7 新增**：触发与恢复按时长而非帧数（1.4 fps 与 8 fps 在同一毫秒触发）；宽限期内的短暂无效只挂起计时、超时才清零；期望帧数随 `fastIntervalMillis` 变化。
+- `pc/test_camera_monitor.py` 的 `StateTest`（v0.7）：基线按 profile 分开存取、v0.6 单基线的迁移与迁移键清理、清除只影响单个 profile、存档损坏或类型不对时安全退回。
 - `CameraLensResolverTest`：视场角公式；前后置直选；超广角四条路径的优先级与各自的命中条件；视场角差距不足时不误选。
 
 ### 7.2 PC 原型
@@ -303,7 +338,7 @@ Authorization: Bearer <deviceToken>
 
 1. **不用 `cv2.VideoCapture(url)`**：它内部有缓冲、断线重连不可控。自己按 multipart 边界解析，配合「只留最新帧」把延迟压到最低，断线走指数退避重连（1 s 起，上限 30 s），与 App 侧相机重连同策略。
 2. **强制绕开系统代理**：机器上设了 `HTTP_PROXY` 时，默认的 urllib 会把局域网地址也扔给代理，表现为 502。手机就在同一个 Wi-Fi 里，永远直连。
-3. **COCO 17 点转 33 点**：只填几何用得到的耳、肩、髋，其余 visibility 置 0，`posture_geometry.analyze` 零改动就能复用。conf 直接当 visibility。
+3. **COCO 17 点转 33 点**：只填几何用得到的耳、肩、髋，其余 visibility 置 0，`posture_geometry.analyze` 零改动就能复用。conf 填进 visibility 字段，但**两者不是一个量纲**：MediaPipe 的 visibility 表示该点是否被遮挡，Ultralytics 给的是关键点自身的 conf，同样是 0.5 含义并不相同。v0.7 起阈值由后端各自给（`--kpt-conf` 与 `--mp-visibility`），不再共用一个 0.5。
 
 模型按显存自动选：16 GB 以上 `yolo26x-pose`，10 GB 以上 l，7 GB 以上 m，再小用 s。torch 装不上时自动回退 MediaPipe 后端。
 

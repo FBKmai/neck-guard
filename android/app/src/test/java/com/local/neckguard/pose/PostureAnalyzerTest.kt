@@ -12,7 +12,8 @@ class PostureAnalyzerTest {
         absoluteThresholdDeg = 40f,
         calibrationDeltaDeg = 12f,
         hysteresisDeg = 4f,
-        minValidFramesPerWindow = 3,
+        minValidFramesFallback = 3,
+        minValidFramesFloor = 1,
         consecutiveBadWindows = 2,
         cooldownMillis = 10_000L,
     )
@@ -258,6 +259,42 @@ class PostureAnalyzerTest {
         analyzer.addFrame(FrameResult.Valid(measurement(20f)))
         analyzer.addFrame(FrameResult.NoPerson)
         assertEquals(1 to 2, analyzer.windowProgress())
+    }
+
+    @Test
+    fun minValidFrames_scalesWithExpectedFrameCount() {
+        // 窗门槛按期望帧数的比例算：换帧率后松紧不变（v0.7）
+        val cfg = AnalyzerConfig(
+            minValidRatio = 1f / 3f,
+            minValidFramesFallback = 8,
+            minValidFramesFloor = 2,
+        )
+        val analyzer = PostureAnalyzer(cfg)
+        analyzer.beginWindow(24)                   // 3 s @ 8 fps
+        assertEquals(8, analyzer.minValidFrames())
+        analyzer.beginWindow(90)                   // 3 s @ 30 fps
+        assertEquals(30, analyzer.minValidFrames())
+        analyzer.beginWindow(4)                    // 帧率极低时被下限兜住
+        assertEquals(2, analyzer.minValidFrames())
+        analyzer.beginWindow()                     // 期望帧数未知，退回绝对门槛
+        assertEquals(8, analyzer.minValidFrames())
+    }
+
+    @Test
+    fun window_invalidWhenValidFramesBelowRatio() {
+        val cfg = AnalyzerConfig(
+            absoluteThresholdDeg = 40f,
+            minValidRatio = 1f / 3f,
+            minValidFramesFloor = 1,
+        )
+        val analyzer = PostureAnalyzer(cfg)
+        analyzer.beginWindow(24)                   // 门槛 8 帧
+        repeat(7) { analyzer.addFrame(FrameResult.Valid(measurement(50f))) }
+        assertEquals(WindowVerdict.INVALID, analyzer.endWindow(0L).summary.verdict)
+
+        analyzer.beginWindow(24)
+        repeat(8) { analyzer.addFrame(FrameResult.Valid(measurement(50f))) }
+        assertEquals(WindowVerdict.BAD, analyzer.endWindow(0L).summary.verdict)
     }
 
     @Test

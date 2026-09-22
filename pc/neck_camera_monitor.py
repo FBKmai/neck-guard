@@ -52,6 +52,9 @@ from neck_receiver import (  # noqa: E402
 LOG = logging.getLogger("neck-camera")
 
 CAMERA_DISCOVERY_PORT = 8768
+
+#: v0.6 存档里只有一个全局基线，迁移时挂到这个 key 下，按 profile 存过一次后清掉
+LEGACY_PROFILE = "_legacy"
 DISCOVERY_MAGIC = "neckguard"
 DISCOVERY_PROBE = "discover-camera"
 DEFAULT_STREAM_PORT = 8767
@@ -324,6 +327,20 @@ class PoseBackend:
 
     name = "base"
 
+    @property
+    def profile(self) -> str:
+        """基线存档用的 key：不同后端 / 不同模型的角度有系统偏差，要分开校准。"""
+        return self.name
+
+    @property
+    def min_visibility(self) -> float:
+        """该后端的关键点可信阈值。
+
+        MediaPipe 的 visibility（点是否被遮挡）与 Ultralytics 的关键点 conf
+        不是一个量纲，同样是 0.5 的含义并不相同，所以让各后端自己给默认值。
+        """
+        return 0.5
+
     def infer(self, bgr) -> Optional[List[pg.Landmark]]:
         raise NotImplementedError
 
@@ -348,7 +365,7 @@ class YoloBackend(PoseBackend):
     name = "yolo"
 
     def __init__(self, model_path: Optional[str], device: Optional[str], imgsz: int,
-                 half: bool, conf: float):
+                 half: bool, conf: float, kpt_conf: float = 0.5):
         try:
             from ultralytics import YOLO
         except ImportError as e:
@@ -373,12 +390,23 @@ class YoloBackend(PoseBackend):
         self.imgsz = imgsz
         self.half = half and self.device != "cpu"
         self.conf = conf
+        self._kpt_conf = kpt_conf
+        self._model_name = Path(path).stem
         self._fail_streak = 0
         # ultralytics 8.4 起 half=True 改成 quantize="fp16"，传旧参数会刷废弃警告。
         # predict 的签名是 **kwargs，探测不到参数名，所以按版本号判断。
         self._precision: Dict[str, object] = {}
         if self.half:
             self._precision = {"quantize": "fp16"} if _ultralytics_at_least(8, 4) else {"half": True}
+
+    @property
+    def profile(self) -> str:
+        # 模型大小不同，关键点位置也有细微系统偏差，基线跟着模型走
+        return f"{self.name}:{self._model_name}"
+
+    @property
+    def min_visibility(self) -> float:
+        return self._kpt_conf
 
     @staticmethod
     def _auto_device() -> str:
@@ -443,7 +471,7 @@ class MediaPipeBackend(PoseBackend):
 
     name = "mediapipe"
 
-    def __init__(self, proxy: Optional[str]):
+    def __init__(self, proxy: Optional[str], visibility: float = 0.5):
         try:
             import posture_probe as probe
         except ImportError as e:
@@ -451,7 +479,12 @@ class MediaPipeBackend(PoseBackend):
         self._probe = probe
         model = probe.ensure_model(proxy)
         self._landmarker = probe.create_landmarker(model, video_mode=True)
+        self._visibility = visibility
         self._t0 = time.monotonic()
+
+    @property
+    def min_visibility(self) -> float:
+        return self._visibility
 
     def infer(self, bgr) -> Optional[List[pg.Landmark]]:
         ts_ms = int((time.monotonic() - self._t0) * 1000)
@@ -470,14 +503,17 @@ class MediaPipeBackend(PoseBackend):
 
 
 def build_backend(args) -> PoseBackend:
+    """两个后端的关键点阈值分开给：不传时各用各的默认值。"""
+    mp_vis = args.mp_visibility if args.mp_visibility is not None else 0.5
     if args.backend == "mediapipe":
-        return MediaPipeBackend(args.proxy)
+        return MediaPipeBackend(args.proxy, mp_vis)
+    kpt_conf = args.kpt_conf if args.kpt_conf is not None else 0.5
     try:
-        return YoloBackend(args.model, args.device, args.imgsz, args.half, args.conf)
+        return YoloBackend(args.model, args.device, args.imgsz, args.half, args.conf, kpt_conf)
     except RuntimeError as e:
         LOG.error("%s", e)
         LOG.warning("改用 MediaPipe 后备后端")
-        return MediaPipeBackend(args.proxy)
+        return MediaPipeBackend(args.proxy, mp_vis)
 
 
 # ----------------------------------------------------------------------------
@@ -485,22 +521,57 @@ def build_backend(args) -> PoseBackend:
 # ----------------------------------------------------------------------------
 @dataclass
 class State:
-    baseline_deg: Optional[float] = None
+    """基线按「后端 + 模型」分开存。
+
+    YOLO 与 MediaPipe 虽然都给耳肩髋，但关键点的定义位置不完全一样，同一个
+    坐姿两边算出的角度可能差几度；换模型大小（s/m/l/x）也有类似的系统偏差。
+    共用一个基线会让换后端之后的阈值整体偏移，所以按 key 分开保存。
+    """
+
+    #: profile key -> 基线角度
+    baselines: Dict[str, float] = field(default_factory=dict)
     last_url: Optional[str] = None
 
     @classmethod
     def load(cls, path: Path) -> "State":
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return cls(baseline_deg=data.get("baseline_deg"), last_url=data.get("last_url"))
         except (OSError, ValueError):
             return cls()
+        if not isinstance(data, dict):
+            return cls()
+        raw = data.get("baselines")
+        baselines: Dict[str, float] = {}
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if isinstance(v, (int, float)):
+                    baselines[str(k)] = float(v)
+        # v0.6 只有一个全局 baseline_deg，迁到 legacy key 上，用户换后端时重新校准
+        legacy = data.get("baseline_deg")
+        if not baselines and isinstance(legacy, (int, float)):
+            baselines[LEGACY_PROFILE] = float(legacy)
+        url = data.get("last_url")
+        return cls(baselines=baselines, last_url=url if isinstance(url, str) else None)
+
+    def baseline_for(self, profile: str) -> Optional[float]:
+        """取该 profile 的基线；没有时退回 v0.6 的全局基线（只用一次，存回时归位）。"""
+        if profile in self.baselines:
+            return self.baselines[profile]
+        return self.baselines.get(LEGACY_PROFILE)
+
+    def set_baseline(self, profile: str, deg: Optional[float]) -> None:
+        if deg is None:
+            self.baselines.pop(profile, None)
+        else:
+            self.baselines[profile] = float(deg)
+        # 一旦按 profile 存过，就不再需要迁移用的旧键
+        self.baselines.pop(LEGACY_PROFILE, None)
 
     def save(self, path: Path) -> None:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
-                json.dumps({"baseline_deg": self.baseline_deg, "last_url": self.last_url},
+                json.dumps({"baselines": self.baselines, "last_url": self.last_url},
                            ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
@@ -591,9 +662,12 @@ class Runtime:
     backend: PoseBackend
     client: MjpegClient
     notify_cfg: NotifyConfig
-    geo_cfg: pg.GeometryConfig
+    #: 逐帧记忆：选侧粘性 + 最近一次可靠的躯干方向
+    geometry: pg.SideAndTorsoMemory
     state: State
     state_path: Path
+    #: 基线存档 key，随后端与模型变化
+    profile: str
     show: bool
     verbose: bool
     #: 最近一帧的 JPEG 与叠加图，供通知附图
@@ -644,7 +718,7 @@ def handle_calibration(rt: Runtime, status: str, m, now: float) -> None:
         LOG.warning("%s", rt.message)
     else:
         baseline = rt.tracker.calibrate(rt.calib_samples)
-        rt.state.baseline_deg = baseline
+        rt.state.set_baseline(rt.profile, baseline)
         rt.state.save(rt.state_path)
         rt.message = f"校准完成，基线 {baseline:.1f}°，阈值 {rt.tracker.threshold_deg:.1f}°"
         LOG.info("%s", rt.message)
@@ -687,10 +761,9 @@ def run(rt: Runtime, stop: threading.Event) -> int:
         h, w = frame.shape[:2]
 
         landmarks = rt.backend.infer(frame)
-        status, m = pg.analyze(landmarks, w, h, rt.geo_cfg)
-
         now = time.monotonic()
         now_ms = int(time.time() * 1000)
+        status, m = rt.geometry.analyze(landmarks, w, h, now_ms)
         handle_calibration(rt, status, m, now)
         handle_events(rt, rt.tracker.on_frame(status, m, now_ms), now_ms)
 
@@ -698,6 +771,9 @@ def run(rt: Runtime, stop: threading.Event) -> int:
         fps_frames += 1
         if now - fps_t0 >= 1.0:
             rt.fps = fps_frames / (now - fps_t0)
+            # 用实测帧率校正窗门槛：电脑端不节流，配置里的间隔只是估计值
+            if rt.fps > 0:
+                rt.tracker.observe_frame_interval(int(1000 / rt.fps))
             fps_t0 = now
             fps_frames = 0
 
@@ -723,7 +799,7 @@ def run(rt: Runtime, stop: threading.Event) -> int:
                 LOG.info("开始校准，请保持端正坐姿 3 秒")
             if key == ord("r"):
                 rt.tracker.set_baseline(None)
-                rt.state.baseline_deg = None
+                rt.state.set_baseline(rt.profile, None)
                 rt.state.save(rt.state_path)
                 rt.message = "已清除校准，使用绝对阈值"
                 LOG.info("%s", rt.message)
@@ -762,14 +838,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", help="推理设备，例如 cuda:0 或 cpu，默认自动")
     p.add_argument("--imgsz", type=int, default=960, help="YOLO 推理分辨率，默认 960")
     p.add_argument("--half", action="store_true", help="半精度推理，GPU 上更快")
-    p.add_argument("--conf", type=float, default=0.25, help="YOLO 置信度下限，默认 0.25")
+    p.add_argument("--conf", type=float, default=0.25, help="YOLO 人体检测置信度下限，默认 0.25")
+    p.add_argument("--kpt-conf", type=float, default=None, dest="kpt_conf",
+                   help="YOLO 关键点可信下限，默认 0.5。与 MediaPipe 的 visibility 不是一个量纲，分开调")
+    p.add_argument("--mp-visibility", type=float, default=None, dest="mp_visibility",
+                   help="MediaPipe 关键点 visibility 下限，默认 0.5")
     p.add_argument("--show", action="store_true", help="开预览窗：c 校准 / r 清除 / q 退出")
     p.add_argument("--threshold", type=float, default=35.0, help="未校准时的绝对阈值（度），默认 35")
     p.add_argument("--delta", type=float, default=12.0, help="校准后阈值 = 基线 + delta，默认 12")
     p.add_argument("--hysteresis", type=float, default=4.0, help="迟滞（度），默认 4")
     p.add_argument("--window-sec", type=float, default=3.0, dest="window_sec", help="确认窗时长（秒），默认 3")
+    p.add_argument("--min-valid-ratio", type=float, default=1.0 / 3.0, dest="min_valid_ratio",
+                   help="确认窗内有效帧至少要占期望帧数的多少，默认 1/3")
+    p.add_argument("--trigger-sec", type=float, default=1.4, dest="trigger_sec",
+                   help="巡检下超阈值持续多少秒进入确认，默认 1.4")
+    p.add_argument("--recover-sec", type=float, default=3.5, dest="recover_sec",
+                   help="低于退出线持续多少秒算恢复，默认 3.5")
+    p.add_argument("--invalid-grace-sec", type=float, default=1.0, dest="invalid_grace_sec",
+                   help="计时途中看不清的容忍时长（秒），默认 1.0")
     p.add_argument("--min-valid-frames", type=int, default=8, dest="min_valid_frames",
-                   help="一个确认窗至少多少有效帧，默认 8")
+                   help="测不出帧率时退回的绝对有效帧门槛，默认 8")
     p.add_argument("--consecutive-windows", type=int, default=2, dest="consecutive_windows",
                    help="连续多少个确认窗判为前倾才提醒，默认 2")
     p.add_argument("--cooldown-min", type=float, default=10.0, dest="cooldown_min",
@@ -778,6 +866,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="侧面对齐判定：肩距/躯干长 上限，默认 0.35")
     p.add_argument("--allow-no-hip", action="store_true", dest="allow_no_hip",
                    help="髋不可见时退回竖直参考继续判定，默认跳过这些帧")
+    p.add_argument("--torso-hold-sec", type=float, default=2.0, dest="torso_hold_sec",
+                   help="髋丢失后沿用上次躯干方向多少秒，0 关闭，默认 2")
     p.add_argument("--baseline", type=float, help="直接指定基线角度，跳过校准")
     p.add_argument("--quiet-hours", default="", help="静默时段，例如 23-7，该时段只记录不提醒")
     p.add_argument("--sound", default="SystemExclamation", help="提示音：wav 路径或系统别名")
@@ -863,23 +953,31 @@ def main(argv=None) -> int:
         absolute_threshold_deg=args.threshold,
         calibration_delta_deg=args.delta,
         hysteresis_deg=args.hysteresis,
-        min_valid_frames_per_window=args.min_valid_frames,
+        min_valid_ratio=args.min_valid_ratio,
+        min_valid_frames_fallback=args.min_valid_frames,
         consecutive_bad_windows=args.consecutive_windows,
         cooldown_millis=int(args.cooldown_min * 60_000),
     )
+    # 电脑端不节流，帧率由手机推流和 GPU 决定，所以间隔先按推流上限估，
+    # 跑起来后 run() 会用实测帧率持续校正窗门槛。
     tracker = pt.PostureTracker(analyzer_cfg, pt.TrackerConfig(
         confirm_window_millis=int(args.window_sec * 1000),
+        trigger_millis=int(args.trigger_sec * 1000),
+        recover_millis=int(args.recover_sec * 1000),
+        invalid_grace_millis=int(args.invalid_grace_sec * 1000),
     ))
-    baseline = args.baseline if args.baseline is not None else state.baseline_deg
-    if baseline is not None:
-        tracker.set_baseline(baseline)
-        state.baseline_deg = baseline
-
+    # 后端要先建：基线按它的 profile 取，关键点阈值也由它决定
     try:
         backend = build_backend(args)
     except Exception as e:  # noqa: BLE001
         LOG.error("姿态后端初始化失败：%s", e)
         return 3
+
+    profile = backend.profile
+    baseline = args.baseline if args.baseline is not None else state.baseline_for(profile)
+    if baseline is not None:
+        tracker.set_baseline(baseline)
+        state.set_baseline(profile, baseline)
 
     stop = threading.Event()
     client = MjpegClient(url, args.token, stop)
@@ -895,10 +993,15 @@ def main(argv=None) -> int:
         backend=backend,
         client=client,
         notify_cfg=notify_cfg,
-        geo_cfg=pg.GeometryConfig(max_shoulder_offset_ratio=args.max_offset,
-                                  require_hip=not args.allow_no_hip),
+        geometry=pg.SideAndTorsoMemory(pg.GeometryConfig(
+            min_visibility=backend.min_visibility,
+            max_shoulder_offset_ratio=args.max_offset,
+            require_hip=not args.allow_no_hip,
+            torso_hold_millis=int(args.torso_hold_sec * 1000),
+        )),
         state=state,
         state_path=state_path,
+        profile=profile,
         show=args.show,
         verbose=args.verbose,
     )

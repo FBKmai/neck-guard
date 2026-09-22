@@ -62,10 +62,12 @@ data class Settings(
     val fastIntervalMillis: Int = 125,
     /** 每个确认窗的时长。 */
     val confirmWindowSec: Int = 3,
-    /** 巡检下连续多少帧超阈值才进入确认。 */
-    val triggerFrames: Int = 2,
-    /** 前倾中连续多少帧低于退出线才算恢复。 */
-    val recoverFrames: Int = 5,
+    /** 巡检下超阈值持续多少毫秒才进入确认。v0.7 起按时长，换帧率行为不变。 */
+    val triggerMillis: Int = 1400,
+    /** 前倾中低于退出线持续多少毫秒才算恢复。 */
+    val recoverMillis: Int = 3500,
+    /** 计时途中看不清的容忍时长，超过才让计时作废。 */
+    val invalidGraceMillis: Int = 1000,
     /** 确认后至少隔多久才允许再次确认。 */
     val retriggerHoldSec: Int = 30,
     /** 确认模式内连续多少个无效窗退回巡检。 */
@@ -74,12 +76,15 @@ data class Settings(
     val absoluteThresholdDeg: Float = 35f,
     val calibrationDeltaDeg: Float = 12f,
     val hysteresisDeg: Float = 4f,
-    val minValidFrames: Int = 8,
+    /** 确认窗内有效帧至少要占期望帧数的多少。v0.7 起按比例，不再是绝对帧数。 */
+    val minValidRatio: Float = 1f / 3f,
     val consecutiveBadWindows: Int = 2,
     val cooldownMin: Int = 10,
     val maxShoulderOffsetRatio: Float = 0.35f,
     /** 关闭时，髋不可见的帧退回竖直参考继续判定；打开（默认）则跳过这些帧。 */
     val requireHip: Boolean = true,
+    /** 髋丢失后沿用上次躯干方向多少毫秒。0 关闭。 */
+    val torsoHoldMillis: Int = 2000,
     /** null 表示未校准。 */
     val baselineDeg: Float? = null,
     val recoveredNotify: RecoveredNotify = RecoveredNotify.PHONE,
@@ -120,7 +125,7 @@ data class Settings(
         absoluteThresholdDeg = absoluteThresholdDeg,
         calibrationDeltaDeg = calibrationDeltaDeg,
         hysteresisDeg = hysteresisDeg,
-        minValidFramesPerWindow = minValidFrames,
+        minValidRatio = minValidRatio,
         consecutiveBadWindows = consecutiveBadWindows,
         cooldownMillis = cooldownMin.toLong() * 60_000L,
     )
@@ -129,8 +134,9 @@ data class Settings(
         slowIntervalMillis = slowIntervalMillis.toLong(),
         fastIntervalMillis = fastIntervalMillis.toLong(),
         confirmWindowMillis = confirmWindowSec.toLong() * 1000L,
-        triggerFrames = triggerFrames,
-        recoverFrames = recoverFrames,
+        triggerMillis = triggerMillis.toLong(),
+        recoverMillis = recoverMillis.toLong(),
+        invalidGraceMillis = invalidGraceMillis.toLong(),
         retriggerHoldMillis = retriggerHoldSec.toLong() * 1000L,
         maxInvalidWindows = maxInvalidWindows,
     ).sanitized()
@@ -138,6 +144,7 @@ data class Settings(
     fun toGeometryConfig(): GeometryConfig = GeometryConfig(
         maxShoulderOffsetRatio = maxShoulderOffsetRatio,
         requireHip = requireHip,
+        torsoHoldMillis = torsoHoldMillis.toLong(),
     )
 }
 
@@ -151,18 +158,20 @@ class SettingsRepository(private val context: Context) {
         val FAST_INTERVAL_MS = intPreferencesKey("fast_interval_ms")
         // 沿用旧 key，v0.2 已设过的确认窗时长可直接继承
         val CONFIRM_WINDOW_SEC = intPreferencesKey("window_sec")
-        val TRIGGER_FRAMES = intPreferencesKey("trigger_frames")
-        val RECOVER_FRAMES = intPreferencesKey("recover_frames")
+        val TRIGGER_MS = intPreferencesKey("trigger_ms")
+        val RECOVER_MS = intPreferencesKey("recover_ms")
+        val INVALID_GRACE_MS = intPreferencesKey("invalid_grace_ms")
         val RETRIGGER_HOLD_SEC = intPreferencesKey("retrigger_hold_sec")
         val MAX_INVALID_WINDOWS = intPreferencesKey("max_invalid_windows")
         val ABSOLUTE_THRESHOLD = floatPreferencesKey("absolute_threshold_deg")
         val CALIBRATION_DELTA = floatPreferencesKey("calibration_delta_deg")
         val HYSTERESIS = floatPreferencesKey("hysteresis_deg")
-        val MIN_VALID_FRAMES = intPreferencesKey("min_valid_frames")
+        val MIN_VALID_RATIO = floatPreferencesKey("min_valid_ratio")
         val CONSECUTIVE_BAD = intPreferencesKey("consecutive_bad_windows")
         val COOLDOWN_MIN = intPreferencesKey("cooldown_min")
         val MAX_SHOULDER_OFFSET = floatPreferencesKey("max_shoulder_offset_ratio")
         val REQUIRE_HIP = booleanPreferencesKey("require_hip")
+        val TORSO_HOLD_MS = intPreferencesKey("torso_hold_ms")
         val BASELINE = floatPreferencesKey("baseline_deg")
         val RECOVERED_NOTIFY = stringPreferencesKey("recovered_notify")
         val PC_ENDPOINT = stringPreferencesKey("pc_endpoint")
@@ -187,6 +196,11 @@ class SettingsRepository(private val context: Context) {
         val LEGACY_INTERVAL_SEC = intPreferencesKey("interval_sec")
         val LEGACY_JITTER_SEC = intPreferencesKey("jitter_sec")
         val LEGACY_SAVE_EVERY_WINDOW = booleanPreferencesKey("save_every_window_snapshot")
+
+        // v0.6 及更早的帧数口径，读到时按当时的送帧间隔折算成时长，写入时清除
+        val LEGACY_TRIGGER_FRAMES = intPreferencesKey("trigger_frames")
+        val LEGACY_RECOVER_FRAMES = intPreferencesKey("recover_frames")
+        val LEGACY_MIN_VALID_FRAMES = intPreferencesKey("min_valid_frames")
     }
 
     val settings: Flow<Settings> = context.settingsStore.data.map { readFrom(it) }
@@ -202,18 +216,20 @@ class SettingsRepository(private val context: Context) {
             p[Keys.SLOW_INTERVAL_MS] = new.slowIntervalMillis
             p[Keys.FAST_INTERVAL_MS] = new.fastIntervalMillis
             p[Keys.CONFIRM_WINDOW_SEC] = new.confirmWindowSec
-            p[Keys.TRIGGER_FRAMES] = new.triggerFrames
-            p[Keys.RECOVER_FRAMES] = new.recoverFrames
+            p[Keys.TRIGGER_MS] = new.triggerMillis
+            p[Keys.RECOVER_MS] = new.recoverMillis
+            p[Keys.INVALID_GRACE_MS] = new.invalidGraceMillis
             p[Keys.RETRIGGER_HOLD_SEC] = new.retriggerHoldSec
             p[Keys.MAX_INVALID_WINDOWS] = new.maxInvalidWindows
             p[Keys.ABSOLUTE_THRESHOLD] = new.absoluteThresholdDeg
             p[Keys.CALIBRATION_DELTA] = new.calibrationDeltaDeg
             p[Keys.HYSTERESIS] = new.hysteresisDeg
-            p[Keys.MIN_VALID_FRAMES] = new.minValidFrames
+            p[Keys.MIN_VALID_RATIO] = new.minValidRatio
             p[Keys.CONSECUTIVE_BAD] = new.consecutiveBadWindows
             p[Keys.COOLDOWN_MIN] = new.cooldownMin
             p[Keys.MAX_SHOULDER_OFFSET] = new.maxShoulderOffsetRatio
             p[Keys.REQUIRE_HIP] = new.requireHip
+            p[Keys.TORSO_HOLD_MS] = new.torsoHoldMillis
             p[Keys.RECOVERED_NOTIFY] = new.recoveredNotify.name
             p[Keys.PC_ENDPOINT] = new.pcEndpoint
             p[Keys.PC_TOKEN] = new.pcToken
@@ -234,6 +250,10 @@ class SettingsRepository(private val context: Context) {
             p.remove(Keys.LEGACY_INTERVAL_SEC)
             p.remove(Keys.LEGACY_JITTER_SEC)
             p.remove(Keys.LEGACY_SAVE_EVERY_WINDOW)
+            // v0.6 的帧数口径已折算成时长与比例，清掉避免以后再走迁移分支
+            p.remove(Keys.LEGACY_TRIGGER_FRAMES)
+            p.remove(Keys.LEGACY_RECOVER_FRAMES)
+            p.remove(Keys.LEGACY_MIN_VALID_FRAMES)
         }
     }
 
@@ -248,25 +268,38 @@ class SettingsRepository(private val context: Context) {
         // v0.4 及更早存的是"相对竖直线"的角度，基线与阈值在新定义下偏大，一律回到新默认值。
         // 用户会在摆放页看到"未校准"提示，重新校准一次即可。
         val legacyGeometry = (p[Keys.GEOMETRY_VERSION] ?: 1) < GEOMETRY_VERSION
+        // v0.6 的帧数口径要按当时的送帧节奏折算，所以先把三个节奏值读出来
+        val slowInterval = p[Keys.SLOW_INTERVAL_MS] ?: d.slowIntervalMillis
+        val fastInterval = p[Keys.FAST_INTERVAL_MS] ?: d.fastIntervalMillis
+        val confirmWindow = p[Keys.CONFIRM_WINDOW_SEC] ?: d.confirmWindowSec
         return Settings(
             cameraLens = lens,
             analysisResolution = AnalysisResolution.parse(p[Keys.ANALYSIS_RESOLUTION]) ?: d.analysisResolution,
             useGpu = p[Keys.USE_GPU] ?: d.useGpu,
-            slowIntervalMillis = p[Keys.SLOW_INTERVAL_MS] ?: d.slowIntervalMillis,
-            fastIntervalMillis = p[Keys.FAST_INTERVAL_MS] ?: d.fastIntervalMillis,
-            confirmWindowSec = p[Keys.CONFIRM_WINDOW_SEC] ?: d.confirmWindowSec,
-            triggerFrames = p[Keys.TRIGGER_FRAMES] ?: d.triggerFrames,
-            recoverFrames = p[Keys.RECOVER_FRAMES] ?: d.recoverFrames,
+            slowIntervalMillis = slowInterval,
+            fastIntervalMillis = fastInterval,
+            confirmWindowSec = confirmWindow,
+            triggerMillis = p[Keys.TRIGGER_MS]
+                ?: p[Keys.LEGACY_TRIGGER_FRAMES]?.let { it * slowInterval } ?: d.triggerMillis,
+            recoverMillis = p[Keys.RECOVER_MS]
+                ?: p[Keys.LEGACY_RECOVER_FRAMES]?.let { it * slowInterval } ?: d.recoverMillis,
+            invalidGraceMillis = p[Keys.INVALID_GRACE_MS] ?: d.invalidGraceMillis,
             retriggerHoldSec = p[Keys.RETRIGGER_HOLD_SEC] ?: d.retriggerHoldSec,
             maxInvalidWindows = p[Keys.MAX_INVALID_WINDOWS] ?: d.maxInvalidWindows,
             absoluteThresholdDeg = (if (legacyGeometry) null else p[Keys.ABSOLUTE_THRESHOLD]) ?: d.absoluteThresholdDeg,
             calibrationDeltaDeg = p[Keys.CALIBRATION_DELTA] ?: d.calibrationDeltaDeg,
             hysteresisDeg = p[Keys.HYSTERESIS] ?: d.hysteresisDeg,
-            minValidFrames = p[Keys.MIN_VALID_FRAMES] ?: d.minValidFrames,
+            minValidRatio = p[Keys.MIN_VALID_RATIO]
+                ?: p[Keys.LEGACY_MIN_VALID_FRAMES]?.let { frames ->
+                    // 旧的绝对帧数按当时的确认窗与快速间隔折算成比例
+                    val expected = (confirmWindow * 1000f / fastInterval.coerceAtLeast(1)).coerceAtLeast(1f)
+                    (frames / expected).coerceIn(0.05f, 1f)
+                } ?: d.minValidRatio,
             consecutiveBadWindows = p[Keys.CONSECUTIVE_BAD] ?: d.consecutiveBadWindows,
             cooldownMin = p[Keys.COOLDOWN_MIN] ?: d.cooldownMin,
             maxShoulderOffsetRatio = p[Keys.MAX_SHOULDER_OFFSET] ?: d.maxShoulderOffsetRatio,
             requireHip = p[Keys.REQUIRE_HIP] ?: d.requireHip,
+            torsoHoldMillis = p[Keys.TORSO_HOLD_MS] ?: d.torsoHoldMillis,
             baselineDeg = if (legacyGeometry) null else p[Keys.BASELINE],
             recoveredNotify = RecoveredNotify.parse(p[Keys.RECOVERED_NOTIFY]) ?: d.recoveredNotify,
             pcEndpoint = p[Keys.PC_ENDPOINT] ?: d.pcEndpoint,

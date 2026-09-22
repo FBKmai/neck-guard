@@ -12,11 +12,10 @@ import com.local.neckguard.camera.CameraLensResolver
 import com.local.neckguard.camera.CameraUseCases
 import com.local.neckguard.data.SettingsRepository
 import com.local.neckguard.pose.FrameResult
-import com.local.neckguard.pose.GeometryConfig
 import com.local.neckguard.pose.PoseFrame
 import com.local.neckguard.pose.PoseLandmarkerEngine
 import com.local.neckguard.pose.PostureAnalyzer
-import com.local.neckguard.pose.PostureGeometry
+import com.local.neckguard.pose.SideAndTorsoMemory
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -74,8 +73,8 @@ class LivePreviewController(
     private var fpsWindowStart = 0L
     private var fpsCount = 0
 
-    @Volatile
-    private var geometryConfig = GeometryConfig()
+    /** 逐帧几何记忆：选侧粘性 + 髋短暂丢失时沿用的躯干方向。 */
+    private val geometryMemory = SideAndTorsoMemory()
 
     @Volatile
     private var analysisResolution = AnalysisResolution.R640x480
@@ -84,7 +83,7 @@ class LivePreviewController(
         settingsJob?.cancel()
         settingsJob = scope.launch {
             settingsRepo.settings.collect { s ->
-                geometryConfig = s.toGeometryConfig()
+                geometryMemory.config = s.toGeometryConfig()
                 analysisResolution = s.analysisResolution
                 _state.update {
                     it.copy(
@@ -191,7 +190,7 @@ class LivePreviewController(
                 fpsWindowStart = now
                 fpsCount = 0
             }
-            val result = PostureGeometry.analyze(frame.landmarks, frame.bitmap.width, frame.bitmap.height, geometryConfig)
+            val result = geometryMemory.analyze(frame.landmarks, frame.bitmap.width, frame.bitmap.height, now)
             _state.update {
                 it.copy(
                     result = result,

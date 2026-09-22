@@ -9,11 +9,12 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import posture_geometry as pg  # noqa: E402
 from posture_geometry import (  # noqa: E402
     BAD, GOOD, INVALID, LANDMARK_COUNT, LEFT_EAR, LEFT_HIP, LEFT_SHOULDER, LOW_VISIBILITY, MISALIGNED,
     NO_PERSON, NO_TORSO, REF_TORSO, REF_VERTICAL, RIGHT_EAR, RIGHT_HIP, RIGHT_SHOULDER, VALID,
     AnalyzerConfig, GeometryConfig, Landmark, Measurement, PostureAnalyzer, analyze, angle_between,
-    inclination_from_vertical, median, threshold_for,
+    inclination_from_vertical, median, pick_side, threshold_for,
 )
 
 
@@ -108,6 +109,139 @@ class GeometryTest(unittest.TestCase):
         self.assertEqual(status, VALID)
         self.assertEqual(m.side, "RIGHT")
 
+    def test_side_score_is_weakest_of_chain(self):
+        """选侧看整条链最弱的一点，不是只看耳朵（v0.7）。"""
+        lms = blank_landmarks()
+        lms[LEFT_EAR] = Landmark(0.4, 0.3, 0.91)
+        lms[LEFT_SHOULDER] = Landmark(0.4, 0.5, 0.54)
+        lms[LEFT_HIP] = Landmark(0.4, 0.8, 0.52)
+        lms[RIGHT_EAR] = Landmark(0.6, 0.3, 0.82)
+        lms[RIGHT_SHOULDER] = Landmark(0.6, 0.5, 0.94)
+        lms[RIGHT_HIP] = Landmark(0.6, 0.8, 0.96)
+        self.assertAlmostEqual(pg.side_score(lms, "LEFT")[1], 0.52, places=6)
+        self.assertAlmostEqual(pg.side_score(lms, "RIGHT")[1], 0.82, places=6)
+        # 旧逻辑只比耳朵会选左（0.91 > 0.82），新逻辑选整条链更稳的右侧
+        self.assertEqual(pick_side(lms), "RIGHT")
+
+    def test_pick_side_falls_back_to_neck_chain_when_both_hips_hidden(self):
+        """髋被桌子挡住时两侧含髋得分都接近 0，此时改比耳肩而不是掷硬币。"""
+        lms = blank_landmarks()
+        lms[LEFT_EAR] = Landmark(0.4, 0.3, 0.95)
+        lms[LEFT_SHOULDER] = Landmark(0.4, 0.5, 0.95)
+        lms[LEFT_HIP] = Landmark(0.4, 0.8, 0.05)
+        lms[RIGHT_EAR] = Landmark(0.6, 0.3, 0.30)
+        lms[RIGHT_SHOULDER] = Landmark(0.6, 0.5, 0.30)
+        lms[RIGHT_HIP] = Landmark(0.6, 0.8, 0.04)
+        # 含髋得分 0.05 vs 0.04 几乎无区分度；耳肩得分 0.95 vs 0.30 差距明确
+        self.assertEqual(pick_side(lms), "LEFT")
+        # 粘性同样生效：右侧耳肩差得多，在用左侧时不会被拉走
+        self.assertEqual(pick_side(lms, "LEFT"), "LEFT")
+
+    def test_pick_side_uses_hip_when_one_side_has_it(self):
+        """只要有一侧的髋可用，就仍按含髋的整条链比。"""
+        lms = blank_landmarks()
+        lms[LEFT_EAR] = Landmark(0.4, 0.3, 0.95)
+        lms[LEFT_SHOULDER] = Landmark(0.4, 0.5, 0.95)
+        lms[LEFT_HIP] = Landmark(0.4, 0.8, 0.10)      # 左髋不可用
+        lms[RIGHT_EAR] = Landmark(0.6, 0.3, 0.75)
+        lms[RIGHT_SHOULDER] = Landmark(0.6, 0.5, 0.75)
+        lms[RIGHT_HIP] = Landmark(0.6, 0.8, 0.70)     # 右边整条链都够用
+        self.assertEqual(pick_side(lms), "RIGHT")
+
+    def test_pick_side_is_sticky_within_margin(self):
+        lms = blank_landmarks()
+        lms[LEFT_EAR] = Landmark(0.4, 0.3, 0.80)
+        lms[LEFT_SHOULDER] = Landmark(0.4, 0.5, 0.80)
+        lms[LEFT_HIP] = Landmark(0.4, 0.8, 0.80)
+        lms[RIGHT_EAR] = Landmark(0.6, 0.3, 0.90)
+        lms[RIGHT_SHOULDER] = Landmark(0.6, 0.5, 0.90)
+        lms[RIGHT_HIP] = Landmark(0.6, 0.8, 0.90)
+        # 没有历史时按分数选右
+        self.assertEqual(pick_side(lms), "RIGHT")
+        # 已经在用左侧：右侧只高 0.10，不到 0.15 的换边门槛，保持左侧不翻转
+        self.assertEqual(pick_side(lms, "LEFT"), "LEFT")
+        # 差距拉大到 0.30 才换
+        lms[RIGHT_EAR] = Landmark(0.6, 0.3, 0.99)
+        lms[RIGHT_SHOULDER] = Landmark(0.6, 0.5, 0.99)
+        lms[RIGHT_HIP] = Landmark(0.6, 0.8, 0.99)
+        self.assertEqual(pick_side(lms, "LEFT"), "RIGHT")
+        # 反向同理：在用右侧时不会被略好的左侧拉走
+        self.assertEqual(pick_side(lms, "RIGHT"), "RIGHT")
+
+    def test_analyze_respects_current_side(self):
+        lms = side_view(0.5, 0.3, 0.5, 0.5, side="RIGHT")
+        # 左侧三点全 0，右侧明显更好，传 LEFT 也会被 margin 判成该换边
+        status, m = analyze(lms, 100, 100, current_side="LEFT")
+        self.assertEqual(status, VALID)
+        self.assertEqual(m.side, "RIGHT")
+
+    def test_torso_hint_holds_angle_when_hip_briefly_lost(self):
+        """髋短暂丢失时沿用上次躯干方向，角度不该跳变（v0.7）。"""
+        mem = pg.SideAndTorsoMemory()
+        # 躯干竖直，头前伸：有髋时相对躯干线约 36.9 度
+        with_hip = side_view(0.6, 0.35, 0.5, 0.5, hip_x=0.5, hip_y=0.8)
+        status, m1 = mem.analyze(with_hip, 100, 100, now_ms=1_000)
+        self.assertEqual(status, VALID)
+        self.assertEqual(m1.neck_reference, REF_TORSO)
+
+        # 下一帧髋没了，其余点不动：沿用方向，角度与上一帧一致
+        no_hip = side_view(0.6, 0.35, 0.5, 0.5, hip_x=None, hip_y=None)
+        status, m2 = mem.analyze(no_hip, 100, 100, now_ms=1_500)
+        self.assertEqual(status, VALID)
+        self.assertEqual(m2.neck_reference, pg.REF_TORSO_HELD)
+        self.assertAlmostEqual(m2.neck_deg, m1.neck_deg, places=4)
+
+        # 超过保留期（默认 2 秒）后退回竖直参考，并按 require_hip 跳过该帧
+        status, m3 = mem.analyze(no_hip, 100, 100, now_ms=4_000)
+        self.assertEqual(status, NO_TORSO)
+        self.assertEqual(m3.neck_reference, REF_VERTICAL)
+
+    def test_held_hint_does_not_renew_itself(self):
+        """沿用的帧不能给自己续期，否则保留期形同虚设。"""
+        mem = pg.SideAndTorsoMemory()
+        mem.analyze(side_view(0.6, 0.35, 0.5, 0.5, hip_x=0.5, hip_y=0.8), 100, 100, now_ms=0)
+        no_hip = side_view(0.6, 0.35, 0.5, 0.5, hip_x=None, hip_y=None)
+        # 每 500 ms 一帧连续沿用，到 2500 ms 时已超过 2000 ms 的保留期
+        for t in (500, 1_000, 1_500, 2_000):
+            status, m = mem.analyze(no_hip, 100, 100, now_ms=t)
+            self.assertEqual(m.neck_reference, pg.REF_TORSO_HELD, f"t={t}")
+        status, m = mem.analyze(no_hip, 100, 100, now_ms=2_500)
+        self.assertEqual(m.neck_reference, REF_VERTICAL)
+
+    def test_torso_hint_prevents_false_alarm_when_leaning_over_desk(self):
+        """伏案时髋一丢，退回竖直会让角度从 11 度跳到 35 度，直接越过阈值误报。"""
+        mem = pg.SideAndTorsoMemory()
+        # 躯干前倾（髋在肩后下方），头再前伸一点
+        with_hip = side_view(0.64, 0.30, 0.50, 0.50, hip_x=0.36, hip_y=0.82)
+        _, m1 = mem.analyze(with_hip, 100, 100, now_ms=0)
+        self.assertLess(m1.neck_deg, 20.0)
+
+        no_hip = side_view(0.64, 0.30, 0.50, 0.50, hip_x=None, hip_y=None)
+        _, m2 = mem.analyze(no_hip, 100, 100, now_ms=500)
+        self.assertEqual(m2.neck_reference, pg.REF_TORSO_HELD)
+        self.assertAlmostEqual(m2.neck_deg, m1.neck_deg, places=3)
+
+        # 对照：不带记忆直接算，角度会跳到 35 度附近
+        _, bare = analyze(no_hip, 100, 100)
+        self.assertEqual(bare.neck_reference, REF_VERTICAL)
+        self.assertGreater(bare.neck_deg - m1.neck_deg, 20.0)
+
+    def test_torso_hint_disabled_by_zero_hold(self):
+        cfg = GeometryConfig(torso_hold_millis=0)
+        mem = pg.SideAndTorsoMemory(cfg)
+        mem.analyze(side_view(0.6, 0.35, 0.5, 0.5, hip_x=0.5, hip_y=0.8), 100, 100, now_ms=0)
+        status, m = mem.analyze(side_view(0.6, 0.35, 0.5, 0.5, hip_x=None, hip_y=None),
+                                100, 100, now_ms=100)
+        self.assertEqual(status, NO_TORSO)
+        self.assertEqual(m.neck_reference, REF_VERTICAL)
+
+    def test_analyze_without_now_ms_keeps_old_behaviour(self):
+        """不传时间戳时行为与 v0.6 完全一致，方便老调用点逐步迁移。"""
+        no_hip = side_view(0.6, 0.35, 0.5, 0.5, hip_x=None, hip_y=None)
+        status, m = analyze(no_hip, 100, 100)
+        self.assertEqual(status, NO_TORSO)
+        self.assertEqual(m.neck_reference, REF_VERTICAL)
+
     def test_analyze_low_visibility(self):
         lms = blank_landmarks()
         lms[LEFT_EAR] = Landmark(0.5, 0.3, 0.9)
@@ -149,7 +283,8 @@ class GeometryTest(unittest.TestCase):
 
 
 CFG = AnalyzerConfig(absolute_threshold_deg=40.0, calibration_delta_deg=12.0, hysteresis_deg=4.0,
-                     min_valid_frames_per_window=3, consecutive_bad_windows=2, cooldown_millis=10_000)
+                     min_valid_frames_fallback=3, min_valid_frames_floor=1,
+                     consecutive_bad_windows=2, cooldown_millis=10_000)
 
 
 def meas(neck, torso=5.0):
@@ -281,6 +416,33 @@ class AnalyzerTest(unittest.TestCase):
         self.assertAlmostEqual(o["median_neck"], 30.0)
         self.assertEqual(o["representative_index"], 2)
         self.assertAlmostEqual(o["representative"].neck_deg, 30.0)
+
+    def test_min_valid_frames_scales_with_expected_frame_count(self):
+        """窗门槛按期望帧数的比例算：换帧率后松紧不变（v0.7）。"""
+        cfg = AnalyzerConfig(min_valid_ratio=1.0 / 3.0, min_valid_frames_fallback=8,
+                             min_valid_frames_floor=2)
+        a = PostureAnalyzer(cfg)
+        a.begin_window(24)                      # 3 s @ 8 fps
+        self.assertEqual(a.min_valid_frames(), 8)
+        a.begin_window(90)                      # 3 s @ 30 fps
+        self.assertEqual(a.min_valid_frames(), 30)
+        a.begin_window(4)                       # 帧率极低时被下限兜住
+        self.assertEqual(a.min_valid_frames(), 2)
+        a.begin_window()                        # 期望帧数未知，退回绝对门槛
+        self.assertEqual(a.min_valid_frames(), 8)
+
+    def test_window_invalid_when_valid_frames_below_ratio(self):
+        cfg = AnalyzerConfig(absolute_threshold_deg=40.0, min_valid_ratio=1.0 / 3.0,
+                             min_valid_frames_floor=1)
+        a = PostureAnalyzer(cfg)
+        a.begin_window(24)                      # 门槛 8 帧
+        for _ in range(7):
+            a.add_frame(VALID, meas(50))
+        self.assertEqual(a.end_window(0)["verdict"], INVALID)
+        a.begin_window(24)
+        for _ in range(8):
+            a.add_frame(VALID, meas(50))
+        self.assertEqual(a.end_window(0)["verdict"], BAD)
 
     def test_torso_median_ignores_none(self):
         a = PostureAnalyzer(CFG)

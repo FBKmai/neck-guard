@@ -21,7 +21,8 @@ sys.path.insert(0, str(PC_DIR))
 sys.path.insert(0, str(PC_DIR.parent / "tools"))
 
 from neck_camera_monitor import (  # noqa: E402
-    COCO_TO_MP, Camera, MjpegClient, discover_cameras, parse_camera_reply, resolve_url,
+    COCO_TO_MP, LEGACY_PROFILE, Camera, MjpegClient, State, discover_cameras, parse_camera_reply,
+    resolve_url,
 )
 
 BOUNDARY = "neckguardframe"
@@ -273,6 +274,65 @@ class KeypointMappingTest(unittest.TestCase):
         self.assertEqual(status, pg.VALID)
         self.assertGreater(m.neck_deg, 0.0)
         self.assertEqual(m.neck_reference, pg.REF_TORSO)
+
+
+class StateTest(unittest.TestCase):
+    """基线按「后端 + 模型」分开存（v0.7）。"""
+
+    def setUp(self):
+        import tempfile
+
+        self._dir = tempfile.TemporaryDirectory()
+        self.path = Path(self._dir.name) / "camera_monitor.json"
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def test_baselines_are_per_profile(self):
+        st = State()
+        st.set_baseline("yolo:yolo26s-pose", 12.0)
+        st.set_baseline("mediapipe", 19.5)
+        st.save(self.path)
+
+        back = State.load(self.path)
+        self.assertAlmostEqual(back.baseline_for("yolo:yolo26s-pose"), 12.0)
+        self.assertAlmostEqual(back.baseline_for("mediapipe"), 19.5)
+        # 没校准过的 profile 拿不到别人的基线
+        self.assertIsNone(back.baseline_for("yolo:yolo26x-pose"))
+
+    def test_legacy_single_baseline_is_migrated(self):
+        self.path.write_text(
+            json.dumps({"baseline_deg": 15.0, "last_url": "http://192.168.1.20:8767/video"}),
+            encoding="utf-8",
+        )
+        st = State.load(self.path)
+        self.assertEqual(st.last_url, "http://192.168.1.20:8767/video")
+        # 迁移期任何 profile 都先用得上旧基线，避免升级后白白重新校准
+        self.assertAlmostEqual(st.baseline_for("yolo:yolo26s-pose"), 15.0)
+        # 一旦按 profile 存过，迁移用的旧键就清掉，其它 profile 不再蹭它
+        st.set_baseline("yolo:yolo26s-pose", 11.0)
+        self.assertNotIn(LEGACY_PROFILE, st.baselines)
+        self.assertIsNone(st.baseline_for("mediapipe"))
+
+    def test_clearing_baseline_removes_only_that_profile(self):
+        st = State()
+        st.set_baseline("yolo:a", 10.0)
+        st.set_baseline("mediapipe", 20.0)
+        st.set_baseline("yolo:a", None)
+        self.assertIsNone(st.baseline_for("yolo:a"))
+        self.assertAlmostEqual(st.baseline_for("mediapipe"), 20.0)
+
+    def test_load_tolerates_broken_file(self):
+        self.path.write_text("not json at all", encoding="utf-8")
+        st = State.load(self.path)
+        self.assertEqual(st.baselines, {})
+        self.assertIsNone(st.last_url)
+        # 类型不对的值直接丢掉，不让坏数据把阈值算飞
+        self.path.write_text(json.dumps({"baselines": {"yolo:a": "bad", "mediapipe": 18.0}}),
+                             encoding="utf-8")
+        st = State.load(self.path)
+        self.assertIsNone(st.baseline_for("yolo:a"))
+        self.assertAlmostEqual(st.baseline_for("mediapipe"), 18.0)
 
 
 if __name__ == "__main__":

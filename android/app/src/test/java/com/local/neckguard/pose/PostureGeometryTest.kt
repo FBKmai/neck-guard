@@ -186,4 +186,136 @@ class PostureGeometryTest {
         val result = PostureGeometry.analyze(lm, 100, 100) as FrameResult.Valid
         assertEquals(0f, result.measurement.torsoInclinationDeg!!, 1e-3f)
     }
+
+    /** 左右两侧各给一组置信度，其余点留空。 */
+    private fun bothSides(
+        leftEar: Float, leftShoulder: Float, leftHip: Float,
+        rightEar: Float, rightShoulder: Float, rightHip: Float,
+    ): List<Landmark> {
+        val lm = blankLandmarks()
+        lm[PoseIndex.LEFT_EAR] = Landmark(0.4f, 0.3f, leftEar)
+        lm[PoseIndex.LEFT_SHOULDER] = Landmark(0.4f, 0.5f, leftShoulder)
+        lm[PoseIndex.LEFT_HIP] = Landmark(0.4f, 0.8f, leftHip)
+        lm[PoseIndex.RIGHT_EAR] = Landmark(0.6f, 0.3f, rightEar)
+        lm[PoseIndex.RIGHT_SHOULDER] = Landmark(0.6f, 0.5f, rightShoulder)
+        lm[PoseIndex.RIGHT_HIP] = Landmark(0.6f, 0.8f, rightHip)
+        return lm
+    }
+
+    @Test
+    fun sideScore_isWeakestOfChain() {
+        // 选侧看整条链最弱的一点，不是只看耳朵（v0.7）
+        val lm = bothSides(0.91f, 0.54f, 0.52f, 0.82f, 0.94f, 0.96f)
+        assertEquals(0.52f, PostureGeometry.sideScore(lm, BodySide.LEFT).full, 1e-6f)
+        assertEquals(0.82f, PostureGeometry.sideScore(lm, BodySide.RIGHT).full, 1e-6f)
+        // 旧逻辑只比耳朵会选左（0.91 > 0.82），新逻辑选整条链更稳的右侧
+        assertEquals(BodySide.RIGHT, PostureGeometry.pickSide(lm))
+    }
+
+    @Test
+    fun pickSide_isStickyWithinMargin() {
+        val lm = bothSides(0.80f, 0.80f, 0.80f, 0.90f, 0.90f, 0.90f)
+        assertEquals(BodySide.RIGHT, PostureGeometry.pickSide(lm))
+        // 已经在用左侧：右侧只高 0.10，不到 0.15 的换边门槛，保持不翻转
+        assertEquals(BodySide.LEFT, PostureGeometry.pickSide(lm, BodySide.LEFT))
+        // 差距拉大到 0.19 才换
+        val wider = bothSides(0.80f, 0.80f, 0.80f, 0.99f, 0.99f, 0.99f)
+        assertEquals(BodySide.RIGHT, PostureGeometry.pickSide(wider, BodySide.LEFT))
+        assertEquals(BodySide.RIGHT, PostureGeometry.pickSide(wider, BodySide.RIGHT))
+    }
+
+    @Test
+    fun pickSide_fallsBackToNeckChain_whenBothHipsHidden() {
+        // 髋被桌子挡住时两侧含髋得分都接近 0，此时改比耳肩而不是掷硬币
+        val lm = bothSides(0.95f, 0.95f, 0.05f, 0.30f, 0.30f, 0.04f)
+        assertEquals(BodySide.LEFT, PostureGeometry.pickSide(lm))
+        assertEquals(BodySide.LEFT, PostureGeometry.pickSide(lm, BodySide.LEFT))
+    }
+
+    @Test
+    fun pickSide_usesHip_whenOneSideHasIt() {
+        // 只要有一侧的髋可用，就仍按含髋的整条链比
+        val lm = bothSides(0.95f, 0.95f, 0.10f, 0.75f, 0.75f, 0.70f)
+        assertEquals(BodySide.RIGHT, PostureGeometry.pickSide(lm))
+    }
+
+    @Test
+    fun analyze_respectsCurrentSide() {
+        val lm = sideView(earX = 0.5f, earY = 0.3f, shoulderX = 0.5f, shoulderY = 0.5f, side = BodySide.RIGHT)
+        // 左侧三点全 0，右侧明显更好，传 LEFT 也会被 margin 判成该换边
+        val result = PostureGeometry.analyze(lm, 100, 100, currentSide = BodySide.LEFT) as FrameResult.Valid
+        assertEquals(BodySide.RIGHT, result.measurement.side)
+    }
+
+    @Test
+    fun torsoHint_holdsAngle_whenHipBrieflyLost() {
+        // 髋短暂丢失时沿用上次躯干方向，角度不该跳变（v0.7）
+        val memory = SideAndTorsoMemory()
+        val withHip = sideView(earX = 0.6f, earY = 0.35f, shoulderX = 0.5f, shoulderY = 0.5f, hipX = 0.5f, hipY = 0.8f)
+        val first = memory.analyze(withHip, 100, 100, 1_000L) as FrameResult.Valid
+        assertEquals(NeckReference.TORSO, first.measurement.neckReference)
+
+        // 下一帧髋没了，其余点不动：沿用方向，角度与上一帧一致
+        val noHip = sideView(earX = 0.6f, earY = 0.35f, shoulderX = 0.5f, shoulderY = 0.5f, hipX = null, hipY = null)
+        val held = memory.analyze(noHip, 100, 100, 1_500L) as FrameResult.Valid
+        assertEquals(NeckReference.TORSO_HELD, held.measurement.neckReference)
+        assertEquals(first.measurement.neckInclinationDeg, held.measurement.neckInclinationDeg, 1e-3f)
+
+        // 超过保留期（默认 2 秒）后退回竖直参考，并按 requireHip 跳过该帧
+        val expired = memory.analyze(noHip, 100, 100, 4_000L) as FrameResult.NoTorso
+        assertEquals(NeckReference.VERTICAL, expired.measurement.neckReference)
+    }
+
+    @Test
+    fun heldHint_doesNotRenewItself() {
+        // 沿用的帧不能给自己续期，否则保留期形同虚设
+        val memory = SideAndTorsoMemory()
+        val withHip = sideView(earX = 0.6f, earY = 0.35f, shoulderX = 0.5f, shoulderY = 0.5f, hipX = 0.5f, hipY = 0.8f)
+        memory.analyze(withHip, 100, 100, 0L)
+        val noHip = sideView(earX = 0.6f, earY = 0.35f, shoulderX = 0.5f, shoulderY = 0.5f, hipX = null, hipY = null)
+        for (t in longArrayOf(500L, 1_000L, 1_500L, 2_000L)) {
+            val r = memory.analyze(noHip, 100, 100, t)
+            assertEquals(NeckReference.TORSO_HELD, r.measurementOrNull!!.neckReference)
+        }
+        val expired = memory.analyze(noHip, 100, 100, 2_500L)
+        assertEquals(NeckReference.VERTICAL, expired.measurementOrNull!!.neckReference)
+    }
+
+    @Test
+    fun torsoHint_preventsFalseAlarm_whenLeaningOverDesk() {
+        // 伏案时髋一丢，退回竖直会让角度从 11 度跳到 35 度，直接越过阈值误报
+        val memory = SideAndTorsoMemory()
+        // 躯干前倾（髋在肩后下方），头再前伸一点
+        val withHip = sideView(earX = 0.64f, earY = 0.30f, shoulderX = 0.50f, shoulderY = 0.50f, hipX = 0.36f, hipY = 0.82f)
+        val first = memory.analyze(withHip, 100, 100, 0L) as FrameResult.Valid
+        assertTrue(first.measurement.neckInclinationDeg < 20f)
+
+        val noHip = sideView(earX = 0.64f, earY = 0.30f, shoulderX = 0.50f, shoulderY = 0.50f, hipX = null, hipY = null)
+        val held = memory.analyze(noHip, 100, 100, 500L) as FrameResult.Valid
+        assertEquals(NeckReference.TORSO_HELD, held.measurement.neckReference)
+        assertEquals(first.measurement.neckInclinationDeg, held.measurement.neckInclinationDeg, 1e-3f)
+
+        // 对照：不带记忆直接算，角度会跳到 35 度附近
+        val bare = PostureGeometry.analyze(noHip, 100, 100) as FrameResult.NoTorso
+        assertEquals(NeckReference.VERTICAL, bare.measurement.neckReference)
+        assertTrue(bare.measurement.neckInclinationDeg - first.measurement.neckInclinationDeg > 20f)
+    }
+
+    @Test
+    fun torsoHint_disabledByZeroHold() {
+        val memory = SideAndTorsoMemory(GeometryConfig(torsoHoldMillis = 0L))
+        val withHip = sideView(earX = 0.6f, earY = 0.35f, shoulderX = 0.5f, shoulderY = 0.5f, hipX = 0.5f, hipY = 0.8f)
+        memory.analyze(withHip, 100, 100, 0L)
+        val noHip = sideView(earX = 0.6f, earY = 0.35f, shoulderX = 0.5f, shoulderY = 0.5f, hipX = null, hipY = null)
+        val result = memory.analyze(noHip, 100, 100, 100L) as FrameResult.NoTorso
+        assertEquals(NeckReference.VERTICAL, result.measurement.neckReference)
+    }
+
+    @Test
+    fun analyze_withoutNowMillis_keepsOldBehaviour() {
+        // 不传时间戳时行为与 v0.6 完全一致
+        val noHip = sideView(earX = 0.6f, earY = 0.35f, shoulderX = 0.5f, shoulderY = 0.5f, hipX = null, hipY = null)
+        val result = PostureGeometry.analyze(noHip, 100, 100) as FrameResult.NoTorso
+        assertEquals(NeckReference.VERTICAL, result.measurement.neckReference)
+    }
 }

@@ -30,9 +30,26 @@ enum class NeckReference {
     /** 髋肩连线（躯干线）的延长方向，躺卧与身体倾斜时都不会误判。 */
     TORSO,
 
-    /** 竖直向上，仅在髋不可见且允许回退时使用。 */
+    /**
+     * 髋刚丢失，沿用最近一次可靠的躯干方向。
+     * 口径与 [TORSO] 相同，角度可直接与之比较，所以照常参与判定。
+     */
+    TORSO_HELD,
+
+    /** 竖直向上，仅在髋不可见、方向提示也过期且允许回退时使用。 */
     VERTICAL,
 }
+
+/**
+ * 最近一次可靠的躯干方向，由调用方持有并逐帧传入。
+ *
+ * 髋被手或桌子短暂挡住时，与其让整帧作废（[FrameResult.NoTorso] 不参与判定）
+ * 或改用竖直参考（换了口径，角度会跳十几度），不如沿用刚才那条躯干线：
+ * 躯干方向变化远比帧间隔慢，一两秒内几乎不动。
+ *
+ * [dx] [dy] 是单位化的躯干方向（由髋指向肩），[atMillis] 是它来自哪一帧。
+ */
+data class TorsoHint(val dx: Float, val dy: Float, val atMillis: Long)
 
 /** 单帧姿态测量结果。角度单位均为度。 */
 data class PostureMeasurement(
@@ -95,6 +112,10 @@ data class GeometryConfig(
      * 髋肩距离至少要有耳肩距离的多少倍，低于此值认为髋点落在肩上、方向不可靠。
      */
     val minTorsoToNeckRatio: Float = 0.8f,
+    /** 另一侧的可用度要高出当前侧这么多才换边，避免逐帧翻转导致角度跳变。 */
+    val sideSwitchMargin: Float = 0.15f,
+    /** 髋丢失后，最近一次可靠的躯干方向还能沿用多久。0 表示关掉这个兜底。 */
+    val torsoHoldMillis: Long = 2_000L,
 )
 
 /**
@@ -115,20 +136,36 @@ object PostureGeometry {
         return Math.toDegrees(acos(cos).toDouble()).toFloat()
     }
 
-    /**
-     * 两个向量 (a1 -> a2) 与 (b1 -> b2) 的夹角，单位度，范围 0..180。
-     * 任一向量长度为 0 时返回 0。
-     */
-    fun angleBetween(a1: PixelPoint, a2: PixelPoint, b1: PixelPoint, b2: PixelPoint): Float {
-        val ax = a2.x - a1.x
-        val ay = a2.y - a1.y
-        val bx = b2.x - b1.x
-        val by = b2.y - b1.y
+    /** 两个向量的夹角，单位度，范围 0..180。任一向量长度为 0 时返回 0。 */
+    fun angleBetweenVectors(ax: Float, ay: Float, bx: Float, by: Float): Float {
         val la = hypot(ax, ay)
         val lb = hypot(bx, by)
         if (la < 1e-4f || lb < 1e-4f) return 0f
         val cos = ((ax * bx + ay * by) / (la * lb)).coerceIn(-1f, 1f)
         return Math.toDegrees(acos(cos).toDouble()).toFloat()
+    }
+
+    /**
+     * 两个向量 (a1 -> a2) 与 (b1 -> b2) 的夹角，单位度，范围 0..180。
+     * 任一向量长度为 0 时返回 0。
+     */
+    fun angleBetween(a1: PixelPoint, a2: PixelPoint, b1: PixelPoint, b2: PixelPoint): Float =
+        angleBetweenVectors(a2.x - a1.x, a2.y - a1.y, b2.x - b1.x, b2.y - b1.y)
+
+    /** 从一帧可靠的髋肩点生成方向提示。两点重合时返回 null。 */
+    fun torsoHintFrom(hip: PixelPoint, shoulder: PixelPoint, nowMillis: Long): TorsoHint? {
+        val dx = shoulder.x - hip.x
+        val dy = shoulder.y - hip.y
+        val len = hypot(dx, dy)
+        if (len < 1e-4f) return null
+        return TorsoHint(dx / len, dy / len, nowMillis)
+    }
+
+    /** 方向提示是否还在保留期内。缺时间戳或关掉保留期时一律不用。 */
+    private fun hintUsable(hint: TorsoHint?, nowMillis: Long?, holdMillis: Long): Boolean {
+        if (hint == null || nowMillis == null || holdMillis <= 0L) return false
+        val age = nowMillis - hint.atMillis
+        return age in 0L..holdMillis
     }
 
     /**
@@ -141,24 +178,70 @@ object PostureGeometry {
 
     fun distance(a: PixelPoint, b: PixelPoint): Float = hypot(b.x - a.x, b.y - a.y)
 
-    /** 用耳朵 visibility 决定使用哪一侧的关键点。 */
-    fun pickSide(landmarks: List<Landmark>): BodySide =
-        if (landmarks[PoseIndex.LEFT_EAR].visibility >= landmarks[PoseIndex.RIGHT_EAR].visibility) {
-            BodySide.LEFT
-        } else {
-            BodySide.RIGHT
-        }
+    /** 一侧的可用度：[neck] 是耳肩链，[full] 是含髋的整条链，各取链上最弱的一点。 */
+    data class SideScore(val neck: Float, val full: Float)
 
+    /**
+     * 一侧的可用度，分耳肩与含髋两档，都取各自链上最弱的一点。
+     *
+     * 耳肩髋是串联关系，任何一点崩掉整条向量都会崩，所以取 min 而不是平均。
+     * 只看耳朵会在「耳朵清楚但肩很糊」时选错边。
+     *
+     * 分两档是因为髋经常被桌子挡住：那时两侧的含髋得分都接近 0，直接比会
+     * 退化成掷硬币，此时应该回到耳肩这一档上比较。
+     */
+    fun sideScore(landmarks: List<Landmark>, side: BodySide): SideScore {
+        val ear = if (side == BodySide.LEFT) PoseIndex.LEFT_EAR else PoseIndex.RIGHT_EAR
+        val shoulder = if (side == BodySide.LEFT) PoseIndex.LEFT_SHOULDER else PoseIndex.RIGHT_SHOULDER
+        val hip = if (side == BodySide.LEFT) PoseIndex.LEFT_HIP else PoseIndex.RIGHT_HIP
+        val neck = minOf(landmarks[ear].visibility, landmarks[shoulder].visibility)
+        return SideScore(neck, minOf(neck, landmarks[hip].visibility))
+    }
+
+    /**
+     * 选用哪一侧的关键点。
+     *
+     * 先比含髋的整条链；两侧的髋都不可用时退回只比耳肩，避免被两个同样接近 0
+     * 的髋置信度主导。[current] 是上一帧用的侧别，给了它就带切换粘性：另一侧要
+     * 高出 [switchMargin] 才换边，否则两边得分接近时会逐帧翻转让角度跳变。
+     */
+    fun pickSide(
+        landmarks: List<Landmark>,
+        current: BodySide? = null,
+        switchMargin: Float = 0.15f,
+        minVisibility: Float = 0.5f,
+    ): BodySide {
+        val leftScore = sideScore(landmarks, BodySide.LEFT)
+        val rightScore = sideScore(landmarks, BodySide.RIGHT)
+        // 两侧都没有可用的髋时，含髋得分没有区分度，改比耳肩
+        val bothHipsHidden = leftScore.full < minVisibility && rightScore.full < minVisibility
+        val left = if (bothHipsHidden) leftScore.neck else leftScore.full
+        val right = if (bothHipsHidden) rightScore.neck else rightScore.full
+        if (current == null) return if (left >= right) BodySide.LEFT else BodySide.RIGHT
+        val other = if (current == BodySide.LEFT) BodySide.RIGHT else BodySide.LEFT
+        val currentScore = if (current == BodySide.LEFT) left else right
+        val otherScore = if (current == BodySide.LEFT) right else left
+        return if (otherScore > currentScore + switchMargin) other else current
+    }
+
+    /**
+     * [currentSide] 是上一帧用的侧别，传了就带切换粘性（见 [pickSide]）。
+     * [torsoHint] 是最近一次可靠的躯干方向，配合 [nowMillis] 在髋短暂丢失时兜底。
+     * 保持纯函数：状态由调用方持有（见 [SideAndTorsoMemory]），本函数不记忆任何东西。
+     */
     fun analyze(
         landmarks: List<Landmark>?,
         imageWidth: Int,
         imageHeight: Int,
         config: GeometryConfig = GeometryConfig(),
+        currentSide: BodySide? = null,
+        torsoHint: TorsoHint? = null,
+        nowMillis: Long? = null,
     ): FrameResult {
         if (landmarks == null || landmarks.size < PoseIndex.COUNT) return FrameResult.NoPerson
         require(imageWidth > 0 && imageHeight > 0) { "image size must be positive" }
 
-        val side = pickSide(landmarks)
+        val side = pickSide(landmarks, currentSide, config.sideSwitchMargin, config.minVisibility)
         val earIdx = if (side == BodySide.LEFT) PoseIndex.LEFT_EAR else PoseIndex.RIGHT_EAR
         val shoulderIdx = if (side == BodySide.LEFT) PoseIndex.LEFT_SHOULDER else PoseIndex.RIGHT_SHOULDER
         val farShoulderIdx = if (side == BodySide.LEFT) PoseIndex.RIGHT_SHOULDER else PoseIndex.LEFT_SHOULDER
@@ -183,11 +266,19 @@ object PostureGeometry {
         val hip = hipVisible?.takeIf { distance(shoulder, it) >= neckLen * config.minTorsoToNeckRatio }
         val torso = hipVisible?.let { inclinationFromVertical(it, shoulder) }
 
-        val reference = if (hip != null) NeckReference.TORSO else NeckReference.VERTICAL
-        val neck = if (hip != null) {
-            neckRelativeToTorso(hip, shoulder, ear)
-        } else {
-            inclinationFromVertical(shoulder, ear)
+        val useHint = hip == null && hintUsable(torsoHint, nowMillis, config.torsoHoldMillis)
+        val reference = when {
+            hip != null -> NeckReference.TORSO
+            useHint -> NeckReference.TORSO_HELD
+            else -> NeckReference.VERTICAL
+        }
+        val neck = when {
+            hip != null -> neckRelativeToTorso(hip, shoulder, ear)
+            // 髋刚丢，沿用最近一次可靠的躯干方向：口径不变，角度可以直接跟之前比
+            useHint -> angleBetweenVectors(
+                torsoHint!!.dx, torsoHint.dy, ear.x - shoulder.x, ear.y - shoulder.y,
+            )
+            else -> inclinationFromVertical(shoulder, ear)
         }
 
         val torsoLen = if (hipVisible != null) distance(shoulder, hipVisible) else neckLen * 2f
@@ -213,8 +304,52 @@ object PostureGeometry {
         return when {
             // 对齐问题优先提示：摆放不对时算出来的角度本来也不可信
             !aligned -> FrameResult.Misaligned(measurement)
-            hip == null && config.requireHip -> FrameResult.NoTorso(measurement)
+            // TORSO_HELD 与 TORSO 是同一个口径，可以照常参与判定；
+            // 只有退到竖直参考（换了口径）才在 requireHip 下跳过这一帧
+            reference == NeckReference.VERTICAL && config.requireHip -> FrameResult.NoTorso(measurement)
             else -> FrameResult.Valid(measurement)
         }
+    }
+}
+
+/**
+ * [PostureGeometry.analyze] 的逐帧记忆：上一帧的侧别 + 最近一次可靠的躯干方向。
+ *
+ * analyze 本身保持纯函数，这点状态放在这里，三个调用方（监测服务、摆放页预览、
+ * 电脑脚本）共用同一套语义，不必各写一遍。
+ *
+ * 线程安全：方法加 synchronized，因为监测服务里由 MediaPipe 回调线程调用，
+ * 停止时可能被主线程 reset。
+ */
+class SideAndTorsoMemory(@Volatile var config: GeometryConfig = GeometryConfig()) {
+
+    private var side: BodySide? = null
+    private var torsoHint: TorsoHint? = null
+
+    @Synchronized
+    fun analyze(
+        landmarks: List<Landmark>?,
+        imageWidth: Int,
+        imageHeight: Int,
+        nowMillis: Long? = null,
+    ): FrameResult {
+        val result = PostureGeometry.analyze(
+            landmarks, imageWidth, imageHeight, config, side, torsoHint, nowMillis,
+        )
+        val m = result.measurementOrNull ?: return result
+        side = m.side
+        // 只有这一帧真的有可靠的髋，才刷新方向提示；沿用的帧不能自我续期，
+        // 否则髋一直不出现也能无限续下去，保留期就形同虚设。
+        val hip = m.hip
+        if (m.neckReference == NeckReference.TORSO && hip != null && nowMillis != null) {
+            PostureGeometry.torsoHintFrom(hip, m.shoulder, nowMillis)?.let { torsoHint = it }
+        }
+        return result
+    }
+
+    @Synchronized
+    fun reset() {
+        side = null
+        torsoHint = null
     }
 }

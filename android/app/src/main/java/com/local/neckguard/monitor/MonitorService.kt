@@ -26,9 +26,9 @@ import com.local.neckguard.pose.FrameResult
 import com.local.neckguard.pose.ModeChangeReason
 import com.local.neckguard.pose.PoseFrame
 import com.local.neckguard.pose.PoseLandmarkerEngine
-import com.local.neckguard.pose.PostureGeometry
 import com.local.neckguard.pose.PostureMeasurement
 import com.local.neckguard.pose.PostureTracker
+import com.local.neckguard.pose.SideAndTorsoMemory
 import com.local.neckguard.pose.TrackerEvent
 import com.local.neckguard.pose.TrackerMode
 import com.local.neckguard.pose.WindowOutcome
@@ -108,6 +108,9 @@ class MonitorService : LifecycleService() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var loopJob: Job? = null
     private var gpuFallbackDone = false
+
+    /** 逐帧几何记忆：选侧粘性 + 髋短暂丢失时沿用的躯干方向。 */
+    private val geometryMemory = SideAndTorsoMemory()
 
     // ---- 无线相机模式 ----
     /** 本次运行是推流而非本机检测。startMonitoring 之后不再变。 */
@@ -485,9 +488,8 @@ class MonitorService : LifecycleService() {
         try {
             val now = System.currentTimeMillis()
             lastFrameAt.set(now)
-            val result = PostureGeometry.analyze(
-                frame.landmarks, frame.bitmap.width, frame.bitmap.height, settings.toGeometryConfig(),
-            )
+            geometryMemory.config = settings.toGeometryConfig()
+            val result = geometryMemory.analyze(frame.landmarks, frame.bitmap.width, frame.bitmap.height, now)
             val events = tracker.onFrame(result, now)
 
             // 模式切换后立刻改送帧间隔，巡检与确认的帧率差异全靠它
@@ -595,7 +597,7 @@ class MonitorService : LifecycleService() {
                 val why = if (event.reason == ModeChangeReason.RETRIGGERED) {
                     "冷却已过仍未恢复，再次确认"
                 } else {
-                    "连续 ${settings.triggerFrames} 帧超阈值，进入确认"
+                    "超阈值持续 ${settings.triggerMillis} ms，进入确认"
                 }
                 eventLog.append(
                     PostureEvent(

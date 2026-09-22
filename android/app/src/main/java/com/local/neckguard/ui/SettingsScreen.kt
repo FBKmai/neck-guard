@@ -197,19 +197,27 @@ fun SettingsScreen(
             onInvalid = { message = it },
         )
         IntField(
-            label = "触发帧数",
-            hint = "巡检中连续多少帧超过阈值就进入确认，默认 2",
-            value = settings.triggerFrames,
-            validate = { it in 1..10 },
-            onSave = { v -> save { it.copy(triggerFrames = v) } },
+            label = "触发时长（毫秒）",
+            hint = "巡检中超过阈值持续多久就进入确认，默认 1400",
+            value = settings.triggerMillis,
+            validate = { it in 100..30_000 },
+            onSave = { v -> save { it.copy(triggerMillis = v) } },
             onInvalid = { message = it },
         )
         IntField(
-            label = "恢复帧数",
-            hint = "前倾后连续多少帧低于阈值减迟滞才算恢复端正，默认 5",
-            value = settings.recoverFrames,
-            validate = { it in 1..30 },
-            onSave = { v -> save { it.copy(recoverFrames = v) } },
+            label = "恢复时长（毫秒）",
+            hint = "前倾后低于阈值减迟滞持续多久才算恢复端正，默认 3500",
+            value = settings.recoverMillis,
+            validate = { it in 100..60_000 },
+            onSave = { v -> save { it.copy(recoverMillis = v) } },
+            onInvalid = { message = it },
+        )
+        IntField(
+            label = "看不清容忍（毫秒）",
+            hint = "计时途中短暂看不清（摸脸、手挡住）多久之内不清零，默认 1000",
+            value = settings.invalidGraceMillis,
+            validate = { it in 0..10_000 },
+            onSave = { v -> save { it.copy(invalidGraceMillis = v) } },
             onInvalid = { message = it },
         )
         IntField(
@@ -228,12 +236,12 @@ fun SettingsScreen(
             onSave = { v -> save { it.copy(maxInvalidWindows = v) } },
             onInvalid = { message = it },
         )
-        IntField(
-            label = "有效帧下限（帧）",
-            hint = "一个确认窗内有效帧少于此值视为无效窗，默认 8",
-            value = settings.minValidFrames,
-            validate = { it >= 1 },
-            onSave = { v -> save { it.copy(minValidFrames = v) } },
+        FloatField(
+            label = "有效帧占比下限",
+            hint = "确认窗内有效帧少于「按帧率推算的期望帧数 × 此值」视为无效窗，默认 0.33",
+            value = settings.minValidRatio,
+            validate = { it in 0.05f..1f },
+            onSave = { v -> save { it.copy(minValidRatio = v) } },
             onInvalid = { message = it },
         )
 
@@ -314,6 +322,15 @@ fun SettingsScreen(
                 "适合髋部长期被桌子挡住，但躺卧时会误报",
             checked = settings.requireHip,
             onChange = { v -> save { it.copy(requireHip = v) } },
+        )
+        IntField(
+            label = "躯干方向保留（毫秒）",
+            hint = "髋被手或桌子短暂挡住时，沿用上次躯干方向多久。躯干方向变化很慢，" +
+                "这段时间内角度口径不变，比退回竖直参考稳。0 关闭，默认 2000",
+            value = settings.torsoHoldMillis,
+            validate = { it in 0..10_000 },
+            onSave = { v -> save { it.copy(torsoHoldMillis = v) } },
+            onInvalid = { message = it },
         )
 
         HorizontalDivider()
