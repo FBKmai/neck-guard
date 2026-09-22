@@ -765,18 +765,47 @@ def handle_calibration(rt: Runtime, status: str, m, now: float) -> None:
     rt.calib_samples = []
 
 
+#: 连续多少次探测不到预览窗才认定用户关了它。
+#: 取 3 而不是 1：OpenCV 的窗口属性在刚创建、被其他窗口遮挡或系统忙时
+#: 偶尔会瞬时报错，一次就退出会让程序莫名其妙地自己关掉。
+WINDOW_GONE_STRIKES = 3
+
+
+def window_gone(name: str) -> bool:
+    """预览窗是否已经被用户关掉。
+
+    只用 getWindowImageRect：窗口存在时返回有效矩形，销毁后抛 cv2.error。
+    刻意不碰 WND_PROP_VISIBLE —— 导入 ultralytics 后它会在窗口正常显示时
+    返回 0，据此退出会导致「一连上手机就自己退出」。
+    """
+    import cv2
+
+    try:
+        rect = cv2.getWindowImageRect(name)
+    except cv2.error:
+        return True
+    if rect is None:
+        return True
+    # 窗口被销毁后部分平台返回全 0 而不抛异常
+    return rect[2] <= 0 or rect[3] <= 0
+
+
 def run(rt: Runtime, stop: threading.Event) -> int:
     import cv2
     import numpy as np
     import posture_probe as probe
 
-    window = "NeckGuard 无线相机"
+    # 窗口名必须是纯 ASCII：OpenCV 5.0 在 Windows 上创建中文名窗口会静默失败，
+    # imshow 不报错但窗口根本没建起来，后续 getWindowImageRect 直接 NULL window，
+    # 表现就是「一连上手机就自己退出」，而且全程看不到预览画面。
+    window = "NeckGuard Wireless Camera"
     last_seq = 0
     started_at = time.monotonic()
     fps_t0 = started_at
     fps_frames = 0
     last_status_at = 0.0
     idle_since = started_at
+    window_miss = 0
 
     while not stop.is_set():
         jpeg, seq = rt.client.latest(last_seq)
@@ -787,8 +816,19 @@ def run(rt: Runtime, stop: threading.Event) -> int:
             if time.monotonic() - idle_since > 15 and rt.client.connected:
                 LOG.warning("已 15 秒没有新画面，手机可能停止了推流")
                 idle_since = time.monotonic()
-            if rt.show and cv2.waitKey(30) & 0xFF in (ord("q"), 27):
-                break
+            if rt.show:
+                if cv2.waitKey(30) & 0xFF in (ord("q"), 27):
+                    break
+                # 手机停了推流之后走的是这条分支，这里也要响应关窗，
+                # 否则关了预览窗程序还在后台空转。
+                if window_miss > 0 or rt.frames > 0:
+                    if window_gone(window):
+                        window_miss += 1
+                        if window_miss >= WINDOW_GONE_STRIKES:
+                            LOG.info("预览窗已关闭，退出")
+                            break
+                    else:
+                        window_miss = 0
             time.sleep(0.01)
             continue
         last_seq = seq
@@ -849,11 +889,20 @@ def run(rt: Runtime, stop: threading.Event) -> int:
                 rt.state.save(rt.state_path)
                 rt.message = "已清除校准，使用绝对阈值"
                 LOG.info("%s", rt.message)
-            try:
-                if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+            # 判断用户是否点了窗口的关闭按钮。
+            #
+            # 不能只看 WND_PROP_VISIBLE：导入 ultralytics 之后它会在窗口明明
+            # 正常显示时返回 0（ultralytics 为了兼容 headless 会动 cv2 的 GUI 环境），
+            # 于是第一帧就被误判成「用户关窗」直接退出。改用 getWindowImageRect：
+            # 窗口还在时返回有效矩形，被销毁后才抛 cv2.error 或返回全 0。
+            # 两个信号都要求「连续多次异常」才认，避免偶发抖动误杀。
+            if window_gone(window):
+                window_miss += 1
+                if window_miss >= WINDOW_GONE_STRIKES:
+                    LOG.info("预览窗已关闭，退出")
                     break
-            except cv2.error:
-                break
+            else:
+                window_miss = 0
 
         if now - last_status_at >= 5.0:
             st = rt.client.stats()
