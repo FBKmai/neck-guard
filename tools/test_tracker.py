@@ -234,6 +234,22 @@ class TrackerTest(unittest.TestCase):
         # 冷却保留，恢复后立刻再前倾只确认不通知
         self.assertEqual(t.last_notify_at, notify_at)
 
+    def test_recovery_timer_also_honours_invalid_grace(self):
+        """恢复方向的计时同样走宽限期，不只是触发方向。"""
+        t = tracker()
+        start = trigger_fast(t, 0)
+        run_fast_window(t, start, 45.0, 46.0, 47.0)
+        run_fast_window(t, start + 3_000, 45.0, 46.0, 47.0)
+        self.assertTrue(t.in_forward_head)
+
+        base = start + 7_000
+        feed(t, base, 30.0)                          # 恢复计时起点
+        t.on_frame(pg.NO_PERSON, None, base + 500)   # 宽限期内，挂起不清零
+        events = feed(t, base + 1_400, 30.0)         # 累计够 recover_millis
+        self.assertEqual(len(kinds(events, EV_RECOVERED)), 1)
+        self.assertFalse(t.in_forward_head)
+        self.assertEqual(t.snapshot().recover_progress_millis, 0)
+
     def test_no_recovery_within_hysteresis_band(self):
         t = tracker()
         start = trigger_fast(t, 0)

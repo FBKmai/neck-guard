@@ -406,6 +406,24 @@ class PostureTrackerTest {
     }
 
     @Test
+    fun recoveryTimer_alsoHonoursInvalidGrace() {
+        // 恢复方向的计时同样走宽限期，不只是触发方向
+        val t = tracker()
+        val start = t.triggerFast(0L)
+        t.runFastWindow(start, 50f, 51f, 52f)
+        t.runFastWindow(start + 3_000L, 50f, 51f, 52f)
+        assertTrue(t.inForwardHead)
+
+        val base = start + 7_000L
+        t.feed(base, 30f)                              // 恢复计时起点
+        t.onFrame(FrameResult.NoPerson, base + 500L)   // 宽限期内，挂起不清零
+        val events = t.feed(base + 1_400L, 30f)        // 累计够 recoverMillis
+        assertEquals(1, events.filterIsInstance<TrackerEvent.Recovered>().size)
+        assertFalse(t.inForwardHead)
+        assertEquals(0L, t.snapshot().recoverProgressMillis)
+    }
+
+    @Test
     fun trigger_isFrameRateIndependent() {
         // 同样的 700 ms 持续前倾，1.4 fps 与 8 fps 都恰好触发，不早也不晚
         val slow = tracker()
