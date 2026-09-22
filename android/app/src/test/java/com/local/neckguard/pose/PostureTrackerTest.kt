@@ -305,8 +305,11 @@ class PostureTrackerTest {
         t.updateConfig(analyzerConfig, trackerConfig.copy(slowIntervalMillis = 500L))
         assertEquals(500L, t.desiredIntervalMillis)
 
+        // triggerMillis = 700，所以要攒够 700 ms 才进确认（与送帧间隔无关）
         t.feed(0L, 50f)
         t.feed(500L, 50f)
+        assertEquals(TrackerMode.SLOW, t.mode)
+        t.feed(700L, 50f)
         assertEquals(TrackerMode.FAST, t.mode)
         t.updateConfig(analyzerConfig, trackerConfig.copy(slowIntervalMillis = 500L, fastIntervalMillis = 100L))
         assertEquals(100L, t.desiredIntervalMillis)

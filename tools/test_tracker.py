@@ -283,6 +283,15 @@ class TrackerTest(unittest.TestCase):
         t.reset()
         self.assertEqual(t.desired_interval_millis, 700)
 
+    def test_trigger_needs_full_duration_regardless_of_frame_count(self):
+        """两帧也好十帧也好，攒够 trigger_millis 才进确认。"""
+        t = tracker()
+        feed(t, 0, 50.0)
+        feed(t, 500, 50.0)          # 才 500 ms，不够 700
+        self.assertEqual(t.mode, SLOW)
+        feed(t, 700, 50.0)
+        self.assertEqual(t.mode, FAST)
+
     def test_reset_during_fast_emits_mode_changed_reset(self):
         t = tracker()
         trigger_fast(t, 0)
