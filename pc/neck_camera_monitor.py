@@ -397,8 +397,14 @@ class YoloBackend(PoseBackend):
         try:
             from ultralytics import YOLO
         except ImportError as e:
+            # 把当前解释器打出来：依赖多半是装在另一个虚拟环境里，
+            # 而脚本被系统 python 启动了，这时照着下面的命令再装一遍也没用。
             raise RuntimeError(
-                "未安装 ultralytics。请执行：\n"
+                f"当前解释器没有 ultralytics：{sys.executable}\n"
+                "如果依赖装在虚拟环境里，请用那个环境的 python 启动，例如：\n"
+                "  G:\\yolo\\venv\\Scripts\\python.exe neck_camera_monitor.py --show\n"
+                "或设环境变量 NECKGUARD_PYTHON 后用 run_camera_monitor.bat。\n"
+                "确实没装过的话：\n"
                 "  pip install -r pc/requirements-camera.txt\n"
                 "GPU 版 torch 另装（5090 等 Blackwell 卡用 cu128）：\n"
                 "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128"
@@ -503,7 +509,13 @@ class MediaPipeBackend(PoseBackend):
         try:
             import posture_probe as probe
         except ImportError as e:
-            raise RuntimeError(f"无法导入 tools/posture_probe.py：{e}") from e
+            # posture_probe 依赖 cv2 与 mediapipe，缺哪个都会走到这里。
+            # 同样把解释器打出来：两个后端都失败时，多半是解释器选错了而不是真没装。
+            raise RuntimeError(
+                f"无法导入 tools/posture_probe.py：{e}\n"
+                f"当前解释器：{sys.executable}\n"
+                "两个后端都用不了时，先确认是不是用错了 Python（依赖常装在虚拟环境里）。"
+            ) from e
         self._probe = probe
         model = probe.ensure_model(proxy)
         self._landmarker = probe.create_landmarker(model, video_mode=True)
