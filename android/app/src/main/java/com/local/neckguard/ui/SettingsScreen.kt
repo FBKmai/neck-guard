@@ -58,6 +58,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
 
+/** [ChoiceRow] 每行最多放几个选项，多的换行，避免长标签在窄屏上被挤出可视区域。 */
+private const val MAX_CHIPS_PER_ROW = 3
+
 @Composable
 fun SettingsScreen(
     settingsRepo: SettingsRepository,
@@ -133,8 +136,9 @@ fun SettingsScreen(
             )
             ChoiceRow(
                 label = "推流分辨率",
-                hint = "电脑端检测用的画面尺寸，越大越准也越占带宽",
-                options = AnalysisResolution.entries,
+                hint = "电脑端检测用的画面尺寸。电脑端的 --imgsz 要跟它取齐，" +
+                    "imgsz 超过推流尺寸只是插值放大，实测会让关键点漂移。1600 以上很吃带宽，掉帧比分辨率低更伤判定",
+                options = AnalysisResolution.forStreaming,
                 selected = settings.streamResolution,
                 optionLabel = { it.label },
                 onSelect = { v -> save { it.copy(streamResolution = v) } },
@@ -479,8 +483,9 @@ fun SettingsScreen(
         )
         ChoiceRow(
             label = "分析分辨率",
-            hint = "越高截图越清晰，转换与编码开销也越大，默认 640x480",
-            options = AnalysisResolution.entries.toList(),
+            hint = "越高截图越清晰，转换与编码开销也越大，默认 640x480。" +
+                "本机用的是 lite 模型，再高也换不来准确率，更高的档位只在推流给电脑时开放",
+            options = AnalysisResolution.forOnDeviceAnalysis,
             selected = settings.analysisResolution,
             optionLabel = { it.label },
             onSelect = { v -> save { it.copy(analysisResolution = v) } },
@@ -640,13 +645,17 @@ private fun <T> ChoiceRow(
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
         Text(label)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 4.dp)) {
-            options.forEach { option ->
-                FilterChip(
-                    selected = option == selected,
-                    onClick = { if (option != selected) onSelect(option) },
-                    label = { Text(optionLabel(option)) },
-                )
+        // 分辨率有 5 档，「1920x1440」这种长标签挤在一行会被推出屏幕且点不到。
+        // 每行最多 3 个分两行排，不引入 FlowRow（它在部分版本还需要实验性注解）。
+        options.chunked(MAX_CHIPS_PER_ROW).forEach { rowOptions ->
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 4.dp)) {
+                rowOptions.forEach { option ->
+                    FilterChip(
+                        selected = option == selected,
+                        onClick = { if (option != selected) onSelect(option) },
+                        label = { Text(optionLabel(option)) },
+                    )
+                }
             }
         }
         Text(

@@ -274,7 +274,11 @@ class SettingsRepository(private val context: Context) {
         val confirmWindow = p[Keys.CONFIRM_WINDOW_SEC] ?: d.confirmWindowSec
         return Settings(
             cameraLens = lens,
-            analysisResolution = AnalysisResolution.parse(p[Keys.ANALYSIS_RESOLUTION]) ?: d.analysisResolution,
+            // 本机检测只开放到 1280x960。存过更高档位（推流模式下选的）时收敛回上限，
+            // 否则设置页的 chip 会一个都不高亮，用户看不出当前用的是哪一档。
+            analysisResolution = AnalysisResolution.parse(p[Keys.ANALYSIS_RESOLUTION])
+                ?.takeIf { it in AnalysisResolution.forOnDeviceAnalysis }
+                ?: d.analysisResolution,
             useGpu = p[Keys.USE_GPU] ?: d.useGpu,
             slowIntervalMillis = slowInterval,
             fastIntervalMillis = fastInterval,

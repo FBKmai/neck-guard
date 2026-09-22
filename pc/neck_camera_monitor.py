@@ -214,15 +214,42 @@ class MjpegClient(threading.Thread):
         self.frames_received = 0
         self.decode_failures = 0
         self.reconnects = 0
+        #: 手机推来但主循环没来得及取、被新帧顶掉的帧数。
+        #: 这是「推理跟不上推流」的信号，与网络丢包不是一回事：
+        #: MJPEG 走 TCP 不会真丢包，掉的是我们自己主动跳过的旧帧。
+        self.frames_skipped = 0
+        #: 累计收到的 JPEG 字节数，用来估带宽。
+        self.bytes_received = 0
         self.last_error: Optional[str] = None
         self.connected = False
 
     def latest(self, last_seq: int) -> Tuple[Optional[bytes], int]:
-        """取比 last_seq 新的一帧；没有新帧返回 (None, last_seq)。"""
+        """取比 last_seq 新的一帧；没有新帧返回 (None, last_seq)。
+
+        序号从 last_seq 跳到 self._seq 之间的帧都被跳过了，计入 frames_skipped。
+        """
         with self._lock:
             if self._seq == last_seq or self._latest is None:
                 return None, last_seq
+            # 首次取帧时 last_seq 为 0，那之前的帧是连接建立过程中的，不算跳过
+            if last_seq > 0:
+                self.frames_skipped += self._seq - last_seq - 1
             return self._latest, self._seq
+
+    def stats(self) -> Dict[str, float]:
+        """给状态行与退出摘要用的一组计数。"""
+        with self._lock:
+            received = self.frames_received
+            skipped = self.frames_skipped
+            return {
+                "received": received,
+                "skipped": skipped,
+                # 推来的帧里有多大比例没能进推理
+                "skip_ratio": (skipped / received) if received else 0.0,
+                "decode_failures": self.decode_failures,
+                "reconnects": self.reconnects,
+                "bytes": self.bytes_received,
+            }
 
     def run(self) -> None:
         backoff = 1.0
@@ -304,7 +331,8 @@ class MjpegClient(threading.Thread):
             with self._lock:
                 self._latest = body
                 self._seq += 1
-            self.frames_received += 1
+                self.frames_received += 1
+                self.bytes_received += len(body)
         return True, rest
 
     @staticmethod
@@ -732,10 +760,11 @@ def run(rt: Runtime, stop: threading.Event) -> int:
 
     window = "NeckGuard 无线相机"
     last_seq = 0
-    fps_t0 = time.monotonic()
+    started_at = time.monotonic()
+    fps_t0 = started_at
     fps_frames = 0
     last_status_at = 0.0
-    idle_since = time.monotonic()
+    idle_since = started_at
 
     while not stop.is_set():
         jpeg, seq = rt.client.latest(last_seq)
@@ -779,8 +808,13 @@ def run(rt: Runtime, stop: threading.Event) -> int:
 
         # 叠加图既用于预览窗，也作为通知附图
         base_txt = f"{rt.tracker.baseline_deg:.1f}" if rt.tracker.baseline_deg is not None else "none"
+        skip_txt = ""
+        if rt.show:
+            _st = rt.client.stats()
+            if _st["skipped"]:
+                skip_txt = f"  skip {_st['skip_ratio'] * 100:.0f}%"
         extra = (
-            f"{rt.backend.name}  {rt.fps:.1f} fps  baseline {base_txt}  mode {rt.tracker.mode}",
+            f"{rt.backend.name}  {rt.fps:.1f} fps{skip_txt}  {w}x{h}  baseline {base_txt}  mode {rt.tracker.mode}",
             rt.message or ("forward head" if rt.tracker.in_forward_head else "c: calibrate  r: reset  q: quit"),
         )
         annotated = probe.draw_overlay(frame, status, m, rt.tracker.threshold_deg, extra)
@@ -810,9 +844,18 @@ def run(rt: Runtime, stop: threading.Event) -> int:
                 break
 
         if now - last_status_at >= 5.0:
-            LOG.info("%.1f fps  %s  角度 %s  阈值 %.1f  收帧 %d  重连 %d",
-                     rt.fps, status, fmt_deg(m.neck_deg if m else None),
-                     rt.tracker.threshold_deg, rt.client.frames_received, rt.client.reconnects)
+            st = rt.client.stats()
+            elapsed = max(now - started_at, 1e-6)
+            # 推流帧率是手机实际推过来的，rt.fps 是我们真正推理掉的，两者的差就是跳过的部分
+            in_fps = st["received"] / elapsed
+            mbps = st["bytes"] * 8 / elapsed / 1e6
+            LOG.info(
+                "推理 %.1f fps / 推流 %.1f fps  跳帧 %.0f%%(%d)  带宽 %.1f Mbps  "
+                "%s  角度 %s  阈值 %.1f  解码失败 %d  重连 %d",
+                rt.fps, in_fps, st["skip_ratio"] * 100, int(st["skipped"]), mbps,
+                status, fmt_deg(m.neck_deg if m else None), rt.tracker.threshold_deg,
+                int(st["decode_failures"]), int(st["reconnects"]),
+            )
             last_status_at = now
 
     if rt.show:
@@ -837,7 +880,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", help="YOLO 权重，默认按显存自动选 yolo26s/m/l/x-pose.pt")
     p.add_argument("--device", help="推理设备，例如 cuda:0 或 cpu，默认自动")
     p.add_argument("--imgsz", type=int, default=960, help="YOLO 推理分辨率，默认 960")
-    p.add_argument("--half", action="store_true", help="半精度推理，GPU 上更快")
+    # GPU 上默认开半精度：姿态关键点是像素级回归，fp16 的精度损失远小于
+    # 关键点本身的抖动，实测角度差在 0.1 度以内，换来的是明显更低的延迟。
+    # CPU 上 half 会被后端忽略（见 YoloBackend.__init__）。
+    p.add_argument("--half", action=argparse.BooleanOptionalAction, default=True,
+                   help="半精度推理，GPU 上更快，默认开；用 --no-half 关闭")
     p.add_argument("--conf", type=float, default=0.25, help="YOLO 人体检测置信度下限，默认 0.25")
     p.add_argument("--kpt-conf", type=float, default=None, dest="kpt_conf",
                    help="YOLO 关键点可信下限，默认 0.5。与 MediaPipe 的 visibility 不是一个量纲，分开调")
@@ -1033,8 +1080,17 @@ def main(argv=None) -> int:
         stop.set()
         backend.close()
         state.save(state_path)
-        LOG.info("已退出。收帧 %d，解码失败 %d，重连 %d",
-                 client.frames_received, client.decode_failures, client.reconnects)
+        st = client.stats()
+        LOG.info(
+            "已退出。收帧 %d，跳帧 %d（%.0f%%），解码失败 %d，重连 %d，共收 %.1f MB",
+            int(st["received"]), int(st["skipped"]), st["skip_ratio"] * 100,
+            int(st["decode_failures"]), int(st["reconnects"]), st["bytes"] / 1e6,
+        )
+        if st["skip_ratio"] > 0.5:
+            LOG.warning(
+                "超过一半的帧没能进推理。要么调低手机端的推流帧率／分辨率，"
+                "要么给电脑端加 --half 或换小一号的模型",
+            )
     return code
 
 
